@@ -51,12 +51,28 @@ def get_client(_api_key: str):
 
 client = get_client(api_key)
 
-# Audio upload
-audio_file = st.file_uploader(
-    "上传宁波话音频 (Upload Ningbo dialect audio)", 
-    type=["mp3", "wav", "m4a", "ogg", "flac", "webm"],
-    help="支持 MP3, WAV, M4A, OGG, FLAC, WebM 格式"
-)
+# Audio input: tabs for upload or record
+tab_upload, tab_record = st.tabs(["📁 上传文件", "🎤 实时录音"])
+
+with tab_upload:
+    audio_file = st.file_uploader(
+        "上传宁波话音频", 
+        type=["mp3", "wav", "m4a", "ogg", "flac", "webm"],
+        help="支持 MP3, WAV, M4A, OGG, FLAC, WebM 格式"
+    )
+
+with tab_record:
+    audio_recording = st.audio_input("点击麦克风开始录音")
+
+# Determine which audio source to use
+audio_source = None
+audio_name = "recording.wav"
+if audio_file:
+    audio_source = audio_file.getvalue()
+    audio_name = audio_file.name
+elif audio_recording:
+    audio_source = audio_recording.getvalue()
+    audio_name = "recording.wav"
 
 def transcribe_audio(audio_bytes: bytes, filename: str) -> dict:
     """Two-method transcription with final Gemini Flash evaluation."""
@@ -161,11 +177,11 @@ def transcribe_audio(audio_bytes: bytes, filename: str) -> dict:
             os.unlink(tmp_path)
 
 # Process button
-if audio_file:
+if audio_source:
     if st.button("开始转写 (Transcribe)", type="primary", use_container_width=True):
         with st.spinner("🔄 正在分析音频..."):
             try:
-                results = transcribe_audio(audio_file.getvalue(), audio_file.name)
+                results = transcribe_audio(audio_source, audio_name)
                 
                 # Display final result prominently
                 st.markdown("### 📝 转写结果")
