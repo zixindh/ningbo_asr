@@ -1,32 +1,35 @@
-"""Ningbo Dialect to Mandarin - Fast Transcription."""
+"""Ningbo Dialect → Mandarin - Auto Transcription."""
 import streamlit as st
 from google import genai
 import tempfile
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
-st.set_page_config(page_title="宁波话转普通话", page_icon="🎙️", layout="centered")
+st.set_page_config(page_title="宁波话", page_icon="🎙️", layout="centered")
 
-# Custom CSS
 st.markdown("""
 <style>
-    .stApp { max-width: 800px; margin: 0 auto; }
-    [data-testid="stAudioInput"] > div { min-height: 100px !important; }
+    .stApp { max-width: 600px; margin: 0 auto; padding-top: 2rem; }
+    [data-testid="stAudioInput"] { display: flex; justify-content: center; }
+    [data-testid="stAudioInput"] > div { min-height: 140px !important; }
     [data-testid="stAudioInput"] button {
-        width: 80px !important; height: 80px !important;
-        border-radius: 50% !important; font-size: 1.5rem !important;
+        width: 120px !important; height: 120px !important;
+        border-radius: 50% !important; font-size: 2rem !important;
     }
-    .bucket { background: #f8f9fa; padding: 1rem; border-radius: 8px; 
-              margin: 0.5rem 0; border-left: 4px solid #ccc; }
-    .bucket-primary { background: #e8f4f8; border-left-color: #1f77b4;
-                      font-size: 1.2rem; font-weight: 500; }
-    .bucket-raw { border-left-color: #ff7f0e; }
-    .bucket-semantic { border-left-color: #2ca02c; }
+    .result { 
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white; padding: 1.5rem; border-radius: 12px; 
+        font-size: 1.4rem; text-align: center; margin: 1.5rem 0;
+        box-shadow: 0 4px 15px rgba(102,126,234,0.4);
+    }
+    .sub { color: #888; font-size: 0.9rem; text-align: center; margin: 0.5rem 0; }
+    h1 { text-align: center; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🎙️ 宁波话转普通话")
+st.markdown('<p class="sub">点击麦克风录音，自动转写</p>', unsafe_allow_html=True)
 
 # API key
 def get_api_key():
@@ -47,105 +50,76 @@ def get_client(_key):
 
 client = get_client(api_key)
 
-# Ningbo vocabulary
-NINGBO_VOCAB = """【宁波话】阿拉=我们,侬=你,伊=他,格=这,噶=那,勒海=在,呒没=没有,晓得=知道,交关=非常,邪气=很"""
+VOCAB = "阿拉=我们,侬=你,伊=他,格=这,勒海=在,呒没=没有,晓得=知道,交关=非常"
 
-# Audio input with proper labels
-st.markdown("### 🎤 点击录音")
-audio_data = st.audio_input("录音", label_visibility="collapsed")
+# Main mic input
+audio = st.audio_input("录音", label_visibility="collapsed")
 
-with st.expander("📁 或上传文件"):
-    uploaded = st.file_uploader("上传音频", type=["mp3","wav","m4a","webm"], label_visibility="collapsed")
+# File upload as fallback (hidden in expander)
+with st.expander("📁 上传文件", expanded=False):
+    uploaded = st.file_uploader("文件", type=["mp3","wav","m4a","webm"], label_visibility="collapsed")
 
-# Determine source
-audio_source = None
-audio_name = "recording.wav"
-if audio_data:
-    audio_source = audio_data.getvalue()
-elif uploaded:
-    audio_source = uploaded.getvalue()
-    audio_name = uploaded.name
-
-def call_api_with_retry(func, max_retries=2):
-    """Call API with retry on failure."""
-    for i in range(max_retries):
+def api_call(func, retries=2):
+    for i in range(retries):
         try:
             return func()
-        except Exception as e:
-            if i < max_retries - 1:
-                time.sleep(1)  # Brief delay before retry
+        except Exception:
+            if i < retries - 1:
+                time.sleep(0.5)
             else:
-                raise e
+                raise
 
-def transcribe(audio_bytes: bytes, filename: str):
-    """Two-step transcription: parallel first pass, then synthesis."""
+def transcribe(audio_bytes: bytes, filename: str = "audio.wav"):
+    """Fast transcription with parallel calls."""
     suffix = os.path.splitext(filename)[1] or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
         f.write(audio_bytes)
-        tmp_path = f.name
+        tmp = f.name
     
     try:
-        uploaded_file = client.files.upload(file=tmp_path)
+        file = client.files.upload(file=tmp)
         
-        # Two parallel calls (reduced from 3 to avoid rate limits)
-        def raw_call():
-            return call_api_with_retry(lambda: client.models.generate_content(
+        def raw():
+            return api_call(lambda: client.models.generate_content(
                 model="gemini-2.5-flash",
-                contents=["仔细听，用汉字记录你听到的发音。只输出汉字。", uploaded_file]
+                contents=["用汉字记录听到的发音，只输出汉字", file]
             ).text.strip())
         
-        def semantic_call():
-            prompt = f"这是宁波方言。{NINGBO_VOCAB}\n输出普通话意思，只输出结果。"
-            return call_api_with_retry(lambda: client.models.generate_content(
+        def semantic():
+            return api_call(lambda: client.models.generate_content(
                 model="gemini-2.5-flash",
-                contents=[prompt, uploaded_file]
+                contents=[f"宁波话音频。{VOCAB}。输出普通话意思，只输出结果", file]
             ).text.strip())
         
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f_raw = ex.submit(raw_call)
-            f_semantic = ex.submit(semantic_call)
+        with ThreadPoolExecutor(2) as ex:
+            r = ex.submit(raw)
+            s = ex.submit(semantic)
         
-        return {"raw": f_raw.result(), "semantic": f_semantic.result()}
+        # Quick synthesis
+        combined = api_call(lambda: client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[f"综合两种宁波话转写给出准确普通话：\n音素:{r.result()}\n语义:{s.result()}\n{VOCAB}\n只输出结果"]
+        ).text.strip())
+        
+        return {"raw": r.result(), "semantic": s.result(), "final": combined}
     finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
-def synthesize(results: dict) -> str:
-    """Final synthesis."""
-    prompt = f"""综合两种宁波话转写，给出最准确的普通话：
-【音素】{results['raw']}
-【语义】{results['semantic']}
-{NINGBO_VOCAB}
-只输出结果。"""
-    return call_api_with_retry(lambda: client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[prompt]
-    ).text.strip())
+# Auto-transcribe when audio is available
+audio_source = audio.getvalue() if audio else (uploaded.getvalue() if uploaded else None)
+audio_name = uploaded.name if uploaded and not audio else "recording.wav"
 
-# Process
 if audio_source:
-    if st.button("⚡ 转写", type="primary", use_container_width=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.caption("🔊 音素")
-            raw_ph = st.empty()
-            raw_ph.info("...")
-        with col2:
-            st.caption("💬 语义")
-            sem_ph = st.empty()
-            sem_ph.info("...")
-        
-        final_ph = st.empty()
-        
+    with st.spinner(""):
         try:
-            results = transcribe(audio_source, audio_name)
-            raw_ph.markdown(f'<div class="bucket bucket-raw">{results["raw"]}</div>', unsafe_allow_html=True)
-            sem_ph.markdown(f'<div class="bucket bucket-semantic">{results["semantic"]}</div>', unsafe_allow_html=True)
+            result = transcribe(audio_source, audio_name)
+            st.markdown(f'<div class="result">{result["final"]}</div>', unsafe_allow_html=True)
             
-            final = synthesize(results)
-            final_ph.markdown(f'<div class="bucket bucket-primary">✨ {final}</div>', unsafe_allow_html=True)
+            with st.expander("详细", expanded=False):
+                st.caption("音素")
+                st.code(result["raw"])
+                st.caption("语义")
+                st.code(result["semantic"])
         except Exception as e:
             st.error(f"错误: {e}")
-
-st.markdown("---")
-st.caption("Gemini 2.5 Flash")
