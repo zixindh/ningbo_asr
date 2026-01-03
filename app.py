@@ -1,40 +1,40 @@
-"""Ningbo Dialect → Mandarin - Live Transcription with VAD."""
+"""Ningbo Dialect → Mandarin - Auto Transcription with History."""
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
 from google import genai
-import numpy as np
 import tempfile
 import os
 import time
-import wave
-import io
 from concurrent.futures import ThreadPoolExecutor
-from collections import deque
-import threading
 
 st.set_page_config(page_title="宁波话", page_icon="🎙️", layout="centered")
 
 st.markdown("""
 <style>
-    .stApp { max-width: 700px; margin: 0 auto; }
+    .stApp { max-width: 650px; margin: 0 auto; }
+    [data-testid="stAudioInput"] { display: flex; justify-content: center; }
+    [data-testid="stAudioInput"] > div { min-height: 120px !important; }
+    [data-testid="stAudioInput"] button {
+        width: 100px !important; height: 100px !important;
+        border-radius: 50% !important; font-size: 1.8rem !important;
+    }
     .result { 
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white; padding: 1rem 1.5rem; border-radius: 10px; 
-        font-size: 1.2rem; margin: 0.5rem 0;
-        box-shadow: 0 2px 10px rgba(102,126,234,0.3);
+        color: white; padding: 1.2rem 1.5rem; border-radius: 12px; 
+        font-size: 1.3rem; text-align: center; margin: 1rem 0;
+        box-shadow: 0 4px 15px rgba(102,126,234,0.4);
     }
     .history { 
-        background: #f5f5f5; padding: 0.8rem 1rem; border-radius: 8px;
-        margin: 0.3rem 0; border-left: 3px solid #667eea;
+        background: #f8f9fa; padding: 0.7rem 1rem; border-radius: 8px;
+        margin: 0.3rem 0; border-left: 3px solid #667eea; font-size: 0.95rem;
     }
-    .status { text-align: center; color: #888; font-size: 0.9rem; }
-    h1 { text-align: center; margin-bottom: 0.5rem; }
-    .sub { text-align: center; color: #666; margin-bottom: 1rem; }
+    .time { color: #999; font-size: 0.75rem; margin-right: 0.5rem; }
+    h1 { text-align: center; }
+    .sub { text-align: center; color: #888; font-size: 0.9rem; margin-bottom: 1.5rem; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎙️ 宁波话实时转写")
-st.markdown('<p class="sub">点击开始录音，自动检测语音并转写</p>', unsafe_allow_html=True)
+st.title("🎙️ 宁波话转普通话")
+st.markdown('<p class="sub">录音后自动转写 · 保留历史记录</p>', unsafe_allow_html=True)
 
 # API key
 def get_api_key():
@@ -57,14 +57,14 @@ client = get_client(api_key)
 
 VOCAB = "阿拉=我们,侬=你,伊=他,格=这,勒海=在,呒没=没有,晓得=知道,交关=非常"
 
-# Initialize session state for history
-if "transcriptions" not in st.session_state:
-    st.session_state.transcriptions = []
-if "processing" not in st.session_state:
-    st.session_state.processing = False
+# Session state for history
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "last_audio_id" not in st.session_state:
+    st.session_state.last_audio_id = None
 
-def transcribe_audio(audio_bytes: bytes) -> dict:
-    """Transcribe audio bytes."""
+def transcribe(audio_bytes: bytes) -> dict:
+    """Fast parallel transcription."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
         f.write(audio_bytes)
         tmp = f.name
@@ -73,16 +73,26 @@ def transcribe_audio(audio_bytes: bytes) -> dict:
         file = client.files.upload(file=tmp)
         
         def raw():
-            return client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=["用汉字记录发音，只输出汉字", file]
-            ).text.strip()
+            for _ in range(2):
+                try:
+                    return client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=["用汉字记录发音，只输出汉字", file]
+                    ).text.strip()
+                except:
+                    time.sleep(0.5)
+            raise Exception("API error")
         
         def semantic():
-            return client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[f"宁波话。{VOCAB}。输出普通话，只输出结果", file]
-            ).text.strip()
+            for _ in range(2):
+                try:
+                    return client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=[f"宁波话。{VOCAB}。输出普通话，只输出结果", file]
+                    ).text.strip()
+                except:
+                    time.sleep(0.5)
+            raise Exception("API error")
         
         with ThreadPoolExecutor(2) as ex:
             r, s = ex.submit(raw), ex.submit(semantic)
@@ -96,123 +106,66 @@ def transcribe_audio(audio_bytes: bytes) -> dict:
     finally:
         os.path.exists(tmp) and os.unlink(tmp)
 
-class AudioProcessor(AudioProcessorBase):
-    """Process audio with VAD and trigger transcription."""
+# Audio input
+audio = st.audio_input("录音", label_visibility="collapsed")
+
+# Auto-transcribe when new audio is recorded
+if audio:
+    audio_id = id(audio)
+    if audio_id != st.session_state.last_audio_id:
+        st.session_state.last_audio_id = audio_id
+        
+        with st.spinner("转写中..."):
+            try:
+                result = transcribe(audio.getvalue())
+                # Add to history
+                st.session_state.history.insert(0, {
+                    "text": result["final"],
+                    "raw": result["raw"],
+                    "semantic": result["semantic"],
+                    "time": time.strftime("%H:%M:%S")
+                })
+            except Exception as e:
+                st.error(f"错误: {e}")
+
+# Show latest result
+if st.session_state.history:
+    latest = st.session_state.history[0]
+    st.markdown(f'<div class="result">{latest["text"]}</div>', unsafe_allow_html=True)
     
-    def __init__(self):
-        self.audio_buffer = []
-        self.sample_rate = 16000
-        self.silence_threshold = 0.01
-        self.silence_duration = 0
-        self.speech_detected = False
-        self.min_speech_duration = 0.5  # seconds
-        self.max_silence_after_speech = 1.0  # seconds
-        self.lock = threading.Lock()
-        self.pending_audio = None
+    # Details
+    with st.expander("详细"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption("音素")
+            st.code(latest["raw"])
+        with col2:
+            st.caption("语义")
+            st.code(latest["semantic"])
+
+# History
+if len(st.session_state.history) > 1:
+    st.markdown("---")
+    st.caption(f"📜 历史 ({len(st.session_state.history)})")
+    for item in st.session_state.history[1:6]:  # Show last 5
+        st.markdown(f'<div class="history"><span class="time">{item["time"]}</span>{item["text"]}</div>', unsafe_allow_html=True)
     
-    def recv(self, frame):
-        """Receive audio frame and detect speech."""
-        audio = frame.to_ndarray().flatten().astype(np.float32) / 32768.0
-        
-        # Simple energy-based VAD
-        energy = np.sqrt(np.mean(audio ** 2))
-        is_speech = energy > self.silence_threshold
-        
-        with self.lock:
-            if is_speech:
-                self.audio_buffer.append(frame.to_ndarray())
-                self.speech_detected = True
-                self.silence_duration = 0
-            elif self.speech_detected:
-                self.audio_buffer.append(frame.to_ndarray())
-                self.silence_duration += len(audio) / self.sample_rate
-                
-                # End of speech detected
-                if self.silence_duration > self.max_silence_after_speech:
-                    if len(self.audio_buffer) > 0:
-                        # Combine audio frames
-                        combined = np.concatenate(self.audio_buffer)
-                        duration = len(combined.flatten()) / self.sample_rate
-                        
-                        if duration >= self.min_speech_duration:
-                            # Convert to WAV bytes
-                            wav_buffer = io.BytesIO()
-                            with wave.open(wav_buffer, 'wb') as wav:
-                                wav.setnchannels(1)
-                                wav.setsampwidth(2)
-                                wav.setframerate(self.sample_rate)
-                                wav.writeframes(combined.tobytes())
-                            self.pending_audio = wav_buffer.getvalue()
-                    
-                    # Reset
-                    self.audio_buffer = []
-                    self.speech_detected = False
-                    self.silence_duration = 0
-        
-        return frame
+    if len(st.session_state.history) > 6:
+        st.caption(f"... 还有 {len(st.session_state.history) - 6} 条")
     
-    def get_pending_audio(self):
-        """Get pending audio for transcription."""
-        with self.lock:
-            audio = self.pending_audio
-            self.pending_audio = None
-            return audio
+    if st.button("清除历史", type="secondary"):
+        st.session_state.history = []
+        st.session_state.last_audio_id = None
+        st.rerun()
 
-# WebRTC streamer for live audio
-ctx = webrtc_streamer(
-    key="ningbo-live",
-    mode=WebRtcMode.SENDONLY,
-    audio_processor_factory=AudioProcessor,
-    media_stream_constraints={"audio": True, "video": False},
-    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-)
-
-# Status indicator
-status_placeholder = st.empty()
-result_placeholder = st.empty()
-
-# Process pending audio when available
-if ctx.audio_processor:
-    pending = ctx.audio_processor.get_pending_audio()
-    if pending:
-        status_placeholder.markdown('<p class="status">🔄 转写中...</p>', unsafe_allow_html=True)
-        try:
-            result = transcribe_audio(pending)
-            # Add to history
-            st.session_state.transcriptions.insert(0, {
-                "text": result["final"],
-                "raw": result["raw"],
-                "semantic": result["semantic"],
-                "time": time.strftime("%H:%M:%S")
-            })
-            status_placeholder.empty()
-            st.rerun()
-        except Exception as e:
-            status_placeholder.error(f"错误: {e}")
-
-# Show current/latest result prominently
-if st.session_state.transcriptions:
-    latest = st.session_state.transcriptions[0]
-    result_placeholder.markdown(f'<div class="result">{latest["text"]}</div>', unsafe_allow_html=True)
-
-# Show history
-if len(st.session_state.transcriptions) > 1:
-    with st.expander(f"📜 历史记录 ({len(st.session_state.transcriptions)})", expanded=False):
-        for i, t in enumerate(st.session_state.transcriptions[1:], 1):
-            st.markdown(f'<div class="history"><small>{t["time"]}</small> {t["text"]}</div>', unsafe_allow_html=True)
-        
-        if st.button("清除历史"):
-            st.session_state.transcriptions = []
-            st.rerun()
-
-# Fallback: file upload
-with st.expander("📁 上传文件", expanded=False):
+# File upload fallback
+with st.expander("📁 上传文件"):
     uploaded = st.file_uploader("文件", type=["mp3","wav","m4a","webm"], label_visibility="collapsed")
     if uploaded:
         with st.spinner("转写中..."):
             try:
-                result = transcribe_audio(uploaded.getvalue())
-                st.session_state.transcriptions.insert(0, {
+                result = transcribe(uploaded.getvalue())
+                st.session_state.history.insert(0, {
                     "text": result["final"],
                     "raw": result["raw"],
                     "semantic": result["semantic"],
@@ -221,12 +174,3 @@ with st.expander("📁 上传文件", expanded=False):
                 st.rerun()
             except Exception as e:
                 st.error(f"错误: {e}")
-
-# Details expander
-if st.session_state.transcriptions:
-    with st.expander("详细分析"):
-        latest = st.session_state.transcriptions[0]
-        st.caption("音素")
-        st.code(latest.get("raw", ""))
-        st.caption("语义")
-        st.code(latest.get("semantic", ""))
