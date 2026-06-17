@@ -1,5 +1,6 @@
 """Ningbo dialect to Mandarin text with Alibaba Fun-ASR realtime."""
 import base64
+from concurrent.futures import Future, ThreadPoolExecutor
 import html
 import io
 import os
@@ -39,6 +40,11 @@ RECORDER_COMPONENT = components.declare_component(
 
 class NoTranscriptError(RuntimeError):
     pass
+
+
+@st.cache_resource
+def get_transcription_pool() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="fun-asr")
 
 
 @dataclass
@@ -362,9 +368,23 @@ def recognize_with_fun_asr(
 
 def transcribe(uploaded_file: Any, api_key: str, throttle_stream: bool = False) -> Transcript:
     prepared_audio = prepare_audio(uploaded_file)
+    return transcribe_prepared_audio(
+        prepared_audio=prepared_audio,
+        api_key=api_key,
+        endpoints=get_fun_asr_endpoints(),
+        throttle_stream=throttle_stream,
+    )
+
+
+def transcribe_prepared_audio(
+    prepared_audio: PreparedAudio,
+    api_key: str,
+    endpoints: list[tuple[str, str]],
+    throttle_stream: bool,
+) -> Transcript:
     try:
         errors: list[str] = []
-        for endpoint_name, endpoint_url in get_fun_asr_endpoints():
+        for endpoint_name, endpoint_url in endpoints:
             try:
                 return recognize_with_fun_asr(
                     prepared_audio=prepared_audio,
@@ -396,7 +416,11 @@ class BrowserAudioFile:
 
 
 def render_stitched_transcript() -> None:
-    stitched_text = " ".join(st.session_state.chunk_texts).strip()
+    stitched_text = " ".join(
+        st.session_state.chunk_results[chunk_id]
+        for chunk_id in sorted(st.session_state.chunk_results)
+        if st.session_state.chunk_results[chunk_id]
+    ).strip()
     visible_text = stitched_text or ""
 
     st.markdown(
@@ -409,7 +433,62 @@ def render_stitched_transcript() -> None:
     )
 
 
-def transcribe_browser_chunk(chunk_data: dict[str, Any], api_key: str) -> None:
+def transcribe_audio_bytes(
+    audio_bytes: bytes,
+    audio_format: str,
+    chunk_id: int,
+    api_key: str,
+    endpoints: list[tuple[str, str]],
+) -> Transcript:
+    audio_file = BrowserAudioFile(audio_bytes, f"chunk-{chunk_id}.{audio_format}")
+    prepared_audio = prepare_audio(audio_file)
+    return transcribe_prepared_audio(
+        prepared_audio=prepared_audio,
+        api_key=api_key,
+        endpoints=endpoints,
+        throttle_stream=True,
+    )
+
+
+def collect_finished_chunks(wait_seconds: float = 0.0) -> None:
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        finished_keys = []
+        for processed_key, job in st.session_state.chunk_jobs.items():
+            future: Future = job["future"]
+            if not future.done():
+                continue
+
+            chunk_id = job["chunk_id"]
+            try:
+                transcript = future.result()
+            except Exception as error:
+                st.session_state.chunk_errors[chunk_id] = str(error)
+            else:
+                st.session_state.chunk_results[chunk_id] = transcript.text
+                st.session_state.total_chunk_seconds += transcript.duration_seconds
+            finished_keys.append(processed_key)
+
+        for processed_key in finished_keys:
+            del st.session_state.chunk_jobs[processed_key]
+
+        if finished_keys or wait_seconds <= 0 or time.monotonic() >= deadline:
+            return
+        time.sleep(0.1)
+
+
+def reset_recording_state() -> None:
+    for job in st.session_state.chunk_jobs.values():
+        future: Future = job["future"]
+        future.cancel()
+    st.session_state.chunk_jobs = {}
+    st.session_state.processed_chunk_ids = set()
+    st.session_state.chunk_results = {}
+    st.session_state.chunk_errors = {}
+    st.session_state.total_chunk_seconds = 0.0
+
+
+def transcribe_browser_chunk(chunk_data: dict[str, Any], api_key: str, endpoints: list[tuple[str, str]]) -> None:
     session_id = str(chunk_data.get("sessionId") or "")
     chunk_id = int(chunk_data.get("chunkId") or 0)
     pcm_base64 = str(chunk_data.get("pcmBase64") or "")
@@ -419,9 +498,7 @@ def transcribe_browser_chunk(chunk_data: dict[str, Any], api_key: str) -> None:
 
     if chunk_data.get("reset") and session_id != st.session_state.current_recorder_session:
         st.session_state.current_recorder_session = session_id
-        st.session_state.processed_chunk_ids = set()
-        st.session_state.chunk_texts = []
-        st.session_state.total_chunk_seconds = 0.0
+        reset_recording_state()
         if not audio_base64:
             return
 
@@ -437,21 +514,27 @@ def transcribe_browser_chunk(chunk_data: dict[str, Any], api_key: str) -> None:
         if peak < MIN_BROWSER_AUDIO_PEAK:
             raise RuntimeError("The browser sent near-silent audio. Check the microphone permission/input and try again.")
 
-    audio_file = BrowserAudioFile(audio_bytes, f"chunk-{chunk_id}.{audio_format}")
-
-    transcript = transcribe(audio_file, api_key, throttle_stream=True)
-
     st.session_state.processed_chunk_ids.add(processed_key)
-    if transcript.text:
-        st.session_state.chunk_texts.append(transcript.text)
-        st.session_state.total_chunk_seconds += transcript.duration_seconds
+    st.session_state.chunk_jobs[processed_key] = {
+        "chunk_id": chunk_id,
+        "future": get_transcription_pool().submit(
+            transcribe_audio_bytes,
+            audio_bytes,
+            audio_format,
+            chunk_id,
+            api_key,
+            endpoints,
+        ),
+    }
 
 
 def init_state() -> None:
     defaults = {
         "current_recorder_session": "",
         "processed_chunk_ids": set(),
-        "chunk_texts": [],
+        "chunk_jobs": {},
+        "chunk_results": {},
+        "chunk_errors": {},
         "total_chunk_seconds": 0.0,
     }
     for key, value in defaults.items():
@@ -467,16 +550,20 @@ st.markdown(
         .stApp {
             background: #fafafa;
         }
+        [data-testid="stHeader"],
+        [data-testid="stToolbar"] {
+            display: none;
+        }
         .block-container {
             max-width: 760px;
-            padding-top: 0.85rem;
+            padding-top: 0.35rem;
             padding-bottom: 1rem;
         }
         .transcript {
             background: #ffffff;
             border: 1px solid #e5e7eb;
             border-radius: 8px;
-            margin-top: 0.65rem;
+            margin-top: 0.1rem;
             min-height: 320px;
             padding: 0.85rem;
         }
@@ -506,14 +593,21 @@ api_key = get_fun_asr_key()
 if not api_key:
     st.warning("FUN_ASR_SG_KEY or FUN_ASR_KEY is missing in Streamlit Secrets.")
 
-chunk_data = RECORDER_COMPONENT(key="ningbo-chunk-recorder", default=None, height=132)
+endpoints = get_fun_asr_endpoints()
+collect_finished_chunks()
+
+chunk_data = RECORDER_COMPONENT(key="ningbo-chunk-recorder", default=None, height=82)
 if chunk_data:
     if not api_key and (chunk_data.get("pcmBase64") or chunk_data.get("wavBase64")):
         st.error("Recognition is paused until FUN_ASR_KEY is configured.")
     else:
         try:
-            transcribe_browser_chunk(chunk_data, api_key)
+            transcribe_browser_chunk(chunk_data, api_key, endpoints)
+            collect_finished_chunks(wait_seconds=4.0)
         except Exception as error:
             st.error(f"Recognition failed: {error}")
+
+for chunk_id in sorted(st.session_state.chunk_errors):
+    st.error(f"Chunk {chunk_id} failed: {st.session_state.chunk_errors[chunk_id]}")
 
 render_stitched_transcript()
