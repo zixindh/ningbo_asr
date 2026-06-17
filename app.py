@@ -1,8 +1,8 @@
 """Ningbo dialect to Mandarin text with Alibaba Fun-ASR realtime."""
+import base64
 import html
 import io
 import os
-import queue
 import tempfile
 import threading
 import time
@@ -14,8 +14,8 @@ from typing import Any
 import dashscope
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 
 MODEL_NAME = "fun-asr-realtime"
@@ -25,36 +25,10 @@ CHUNK_SIZE_BYTES = 3200
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 MAINLAND_PRICE_USD_PER_SECOND = 0.000047
 SUPPORTED_UPLOAD_TYPES = ["wav", "mp3", "aac", "amr", "opus", "speex"]
-DEFAULT_ICE_SERVERS = [
-    {"urls": ["stun:stun.l.google.com:19302"]},
-    {"urls": ["stun:stun1.l.google.com:19302"]},
-    {"urls": ["stun:global.stun.twilio.com:3478"]},
-]
-
-
-def patch_streamlit_webrtc_shutdown() -> None:
-    try:
-        from streamlit_webrtc import shutdown
-    except Exception:
-        return
-
-    observer_class = getattr(shutdown, "SessionShutdownObserver", None)
-    if not observer_class or getattr(observer_class, "_ningbo_patch_applied", False):
-        return
-
-    original_stop = observer_class.stop
-
-    def safe_stop(self: Any) -> Any:
-        polling_thread = getattr(self, "_polling_thread", None)
-        if polling_thread is None:
-            return None
-        return original_stop(self)
-
-    observer_class.stop = safe_stop
-    observer_class._ningbo_patch_applied = True
-
-
-patch_streamlit_webrtc_shutdown()
+RECORDER_COMPONENT = components.declare_component(
+    "chunk_recorder",
+    path=str(Path(__file__).parent / "chunk_recorder"),
+)
 
 
 @dataclass
@@ -126,36 +100,6 @@ def get_secret(name: str) -> str:
     return str(value or os.environ.get(name, "")).strip()
 
 
-def split_secret_list(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
-def get_rtc_configuration() -> dict[str, Any]:
-    ice_servers = DEFAULT_ICE_SERVERS.copy()
-
-    turn_urls = split_secret_list(get_secret("TURN_URLS"))
-    turn_username = get_secret("TURN_USERNAME")
-    turn_credential = get_secret("TURN_CREDENTIAL")
-    if turn_urls and turn_username and turn_credential:
-        ice_servers.append(
-            {
-                "urls": turn_urls,
-                "username": turn_username,
-                "credential": turn_credential,
-            }
-        )
-
-    return {"iceServers": ice_servers}
-
-
-def has_turn_configuration() -> bool:
-    return bool(
-        split_secret_list(get_secret("TURN_URLS"))
-        and get_secret("TURN_USERNAME")
-        and get_secret("TURN_CREDENTIAL")
-    )
-
-
 def wav_to_mono_16k(raw_audio: bytes) -> tuple[bytes, float]:
     with wave.open(io.BytesIO(raw_audio), "rb") as source:
         channels = source.getnchannels()
@@ -209,56 +153,6 @@ def wav_to_mono_16k(raw_audio: bytes) -> tuple[bytes, float]:
         target.writeframes(pcm16)
 
     return output.getvalue(), duration_seconds
-
-
-def audio_frame_to_pcm16(frame: Any) -> tuple[bytes, float]:
-    samples = np.asarray(frame.to_ndarray())
-    sample_rate = int(getattr(frame, "sample_rate", TARGET_SAMPLE_RATE) or TARGET_SAMPLE_RATE)
-
-    if samples.ndim == 2:
-        if samples.shape[0] <= 8:
-            samples = samples.mean(axis=0)
-        elif samples.shape[1] <= 8:
-            samples = samples.mean(axis=1)
-        else:
-            samples = samples.reshape(-1)
-    else:
-        samples = samples.reshape(-1)
-
-    if samples.size == 0:
-        return b"", 0.0
-
-    if np.issubdtype(samples.dtype, np.integer):
-        info = np.iinfo(samples.dtype)
-        max_value = float(max(abs(info.min), info.max))
-        samples = samples.astype(np.float32) / max_value
-    else:
-        samples = samples.astype(np.float32)
-
-    duration_seconds = samples.size / sample_rate
-    if sample_rate != TARGET_SAMPLE_RATE:
-        target_count = max(1, int(round(duration_seconds * TARGET_SAMPLE_RATE)))
-        source_positions = np.linspace(0.0, duration_seconds, num=samples.size, endpoint=False)
-        target_positions = np.linspace(0.0, duration_seconds, num=target_count, endpoint=False)
-        samples = np.interp(target_positions, source_positions, samples).astype(np.float32)
-
-    pcm16 = np.clip(samples * 32767.0, -32768, 32767).astype("<i2").tobytes()
-    return pcm16, duration_seconds
-
-
-def create_recognition(api_key: str, callback: FunAsrCallback) -> Recognition:
-    dashscope.api_key = api_key
-    dashscope.base_websocket_api_url = MAINLAND_WEBSOCKET_URL
-    return Recognition(
-        model=MODEL_NAME,
-        format="pcm",
-        sample_rate=TARGET_SAMPLE_RATE,
-        language_hints=["zh"],
-        semantic_punctuation_enabled=st.session_state.semantic_punctuation_enabled,
-        max_sentence_silence=st.session_state.max_sentence_silence,
-        heartbeat=True,
-        callback=callback,
-    )
 
 
 def write_temp_audio(raw_audio: bytes, suffix: str) -> str:
@@ -368,7 +262,7 @@ def recognize_with_fun_asr(
     )
 
 
-def transcribe(uploaded_file: Any, api_key: str) -> Transcript:
+def transcribe(uploaded_file: Any, api_key: str, throttle_stream: bool | None = None) -> Transcript:
     prepared_audio = prepare_audio(uploaded_file)
     try:
         return recognize_with_fun_asr(
@@ -376,7 +270,7 @@ def transcribe(uploaded_file: Any, api_key: str) -> Transcript:
             api_key=api_key,
             semantic_punctuation_enabled=st.session_state.semantic_punctuation_enabled,
             max_sentence_silence=st.session_state.max_sentence_silence,
-            throttle_stream=st.session_state.throttle_stream,
+            throttle_stream=st.session_state.throttle_stream if throttle_stream is None else throttle_stream,
         )
     finally:
         if os.path.exists(prepared_audio.path):
@@ -428,92 +322,92 @@ def render_transcript(transcript: Transcript) -> None:
         )
 
 
-def render_live_card(placeholder: Any, text: str, elapsed_seconds: float, is_active: bool) -> None:
-    status = "正在实时识别" if is_active else "已停止"
-    visible_text = text or "请点击 START，允许麦克风权限，然后直接说宁波话。"
-    placeholder.markdown(
+class BrowserAudioFile:
+    def __init__(self, audio_bytes: bytes, name: str) -> None:
+        self._audio_bytes = audio_bytes
+        self.name = name
+
+    def getvalue(self) -> bytes:
+        return self._audio_bytes
+
+
+def render_stitched_transcript() -> None:
+    stitched_text = " ".join(st.session_state.chunk_texts).strip()
+    visible_text = stitched_text or "点击 START 后直接说宁波话。应用会每 5 秒自动识别并拼接。"
+    chunk_count = len(st.session_state.chunk_texts)
+    duration_seconds = st.session_state.total_chunk_seconds
+
+    st.markdown(
         f"""
         <div class="result-card">
-            <div class="result-label">{status} · {elapsed_seconds:.1f}s</div>
+            <div class="result-label">自动分段识别 · {chunk_count} 段 · {duration_seconds:.1f}s</div>
             <div class="result-text">{html.escape(visible_text)}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
+    if st.session_state.chunk_texts:
+        with st.expander("5 秒分段结果"):
+            for item in st.session_state.chunk_items:
+                st.write(f"{item['chunk_id']}. {item['text']}")
 
-def stream_microphone_to_fun_asr(ctx: Any, api_key: str) -> Transcript | None:
-    audio_receiver = ctx.audio_receiver
-    if not audio_receiver:
-        return None
 
-    callback = FunAsrCallback()
-    recognition = create_recognition(api_key, callback)
-    live_placeholder = st.empty()
-    metric_placeholder = st.empty()
-    segment_placeholder = st.empty()
-    started_at = time.monotonic()
-    streamed_seconds = 0.0
+def transcribe_browser_chunk(chunk_data: dict[str, Any], api_key: str) -> None:
+    session_id = str(chunk_data.get("sessionId") or "")
+    if chunk_data.get("reset") and session_id != st.session_state.current_recorder_session:
+        st.session_state.current_recorder_session = session_id
+        st.session_state.processed_chunk_ids = set()
+        st.session_state.chunk_texts = []
+        st.session_state.chunk_items = []
+        st.session_state.total_chunk_seconds = 0.0
+        return
 
-    # SECURITY-REVIEW: Microphone frames are streamed to Alibaba ASR and not persisted locally.
-    recognition.start()
-    render_live_card(live_placeholder, "", 0.0, True)
+    chunk_id = int(chunk_data.get("chunkId") or 0)
+    wav_base64 = str(chunk_data.get("wavBase64") or "")
+    processed_key = f"{session_id}:{chunk_id}"
+    if not chunk_id or not wav_base64 or processed_key in st.session_state.processed_chunk_ids:
+        return
 
-    try:
-        while ctx.state.playing:
-            try:
-                frames = audio_receiver.get_frames(timeout=1)
-            except queue.Empty:
-                frames = []
+    audio_bytes = base64.b64decode(wav_base64)
+    audio_file = BrowserAudioFile(audio_bytes, f"chunk-{chunk_id}.wav")
 
-            for frame in frames:
-                pcm16, frame_seconds = audio_frame_to_pcm16(frame)
-                if not pcm16:
-                    continue
-                recognition.send_audio_frame(pcm16)
-                streamed_seconds += frame_seconds
+    with st.spinner(f"正在识别第 {chunk_id} 段..."):
+        transcript = transcribe(audio_file, api_key, throttle_stream=False)
 
-            error_message = callback.error()
-            if error_message:
-                raise RuntimeError(error_message)
+    st.session_state.processed_chunk_ids.add(processed_key)
+    if transcript.text:
+        st.session_state.chunk_texts.append(transcript.text)
+        st.session_state.chunk_items.append(
+            {
+                "chunk_id": chunk_id,
+                "text": transcript.text,
+                "request_id": transcript.request_id,
+                "duration_seconds": transcript.duration_seconds,
+            }
+        )
+        st.session_state.total_chunk_seconds += transcript.duration_seconds
 
-            elapsed_seconds = time.monotonic() - started_at
-            text = callback.final_text()
-            render_live_card(live_placeholder, text, elapsed_seconds, True)
-            metric_placeholder.caption(
-                f"已发送 {streamed_seconds:.1f}s 音频 · "
-                f"预估费用 ${streamed_seconds * MAINLAND_PRICE_USD_PER_SECOND:.6f}"
-            )
-
-            segments = callback.segment_texts()
-            if segments:
-                segment_placeholder.write(" / ".join(segments[-3:]))
-
-            time.sleep(0.03)
-    finally:
-        recognition.stop()
-
-    text = callback.final_text()
-    if not text:
-        render_live_card(live_placeholder, "", streamed_seconds, False)
-        return None
-
-    transcript = Transcript(
-        text=text,
-        segments=callback.segment_texts(),
-        request_id=recognition.get_last_request_id(),
-        duration_seconds=streamed_seconds,
-        first_package_delay_ms=recognition.get_first_package_delay(),
-        last_package_delay_ms=recognition.get_last_package_delay(),
-        estimated_cost_usd=streamed_seconds * MAINLAND_PRICE_USD_PER_SECOND,
-    )
-    render_live_card(live_placeholder, transcript.text, streamed_seconds, False)
-    return transcript
+        stitched = Transcript(
+            text=" ".join(st.session_state.chunk_texts).strip(),
+            segments=st.session_state.chunk_texts.copy(),
+            request_id=transcript.request_id,
+            duration_seconds=st.session_state.total_chunk_seconds,
+            first_package_delay_ms=transcript.first_package_delay_ms,
+            last_package_delay_ms=transcript.last_package_delay_ms,
+            estimated_cost_usd=st.session_state.total_chunk_seconds * MAINLAND_PRICE_USD_PER_SECOND,
+        )
+        add_history("自动分段", stitched)
 
 
 def init_state() -> None:
     defaults = {
         "history": [],
+        "current_recorder_session": "",
+        "processed_chunk_ids": set(),
+        "chunk_texts": [],
+        "chunk_items": [],
+        "total_chunk_seconds": 0.0,
         "semantic_punctuation_enabled": False,
         "max_sentence_silence": 900,
         "throttle_stream": True,
@@ -603,36 +497,28 @@ with st.sidebar:
     st.session_state.throttle_stream = st.toggle(
         "上传文件按实时速度发送",
         value=st.session_state.throttle_stream,
-        help="只影响上传文件；实时麦克风会按真实语速发送。",
+        help="只影响上传文件；麦克风自动分段会快速识别每个 5 秒片段。",
     )
     st.caption("模型：fun-asr-realtime · Endpoint：dashscope.aliyuncs.com")
-    if has_turn_configuration():
-        st.success("TURN relay configured for microphone connection.")
-    else:
-        st.warning("No TURN relay configured. Some networks may not connect with STUN only.")
 
-live_tab, upload_tab = st.tabs(["实时麦克风", "上传音频"])
+live_tab, upload_tab = st.tabs(["连续录音", "上传音频"])
 
 with live_tab:
-    st.info("点击 START 并允许麦克风权限后，直接说宁波话（吴语）。文字会自动实时更新。")
-    if not has_turn_configuration():
-        st.caption("如果一直显示连接中，请在 Streamlit Secrets 添加 TURN relay 设置。上传音频仍可作为备用。")
-    ctx = webrtc_streamer(
-        key="ningbo-live-microphone",
-        mode=WebRtcMode.SENDONLY,
-        media_stream_constraints={"audio": True, "video": False},
-        audio_receiver_size=1024,
-        rtc_configuration=get_rtc_configuration(),
-    )
-
-    if ctx.state.playing and ctx.audio_receiver:
+    st.info("点击 START 后直接说宁波话（吴语），点击 STOP 结束。应用会自动每 5 秒识别并拼接。")
+    chunk_data = RECORDER_COMPONENT(key="ningbo-chunk-recorder", default=None)
+    if chunk_data:
         try:
-            transcript = stream_microphone_to_fun_asr(ctx, api_key)
-            if transcript:
-                add_history("实时麦克风", transcript)
-                render_transcript(transcript)
+            transcribe_browser_chunk(chunk_data, api_key)
         except Exception as error:
-            st.error(f"实时识别失败：{error}")
+            st.error(f"分段识别失败：{error}")
+
+    render_stitched_transcript()
+    if st.button("清除当前拼接文本"):
+        st.session_state.processed_chunk_ids = set()
+        st.session_state.chunk_texts = []
+        st.session_state.chunk_items = []
+        st.session_state.total_chunk_seconds = 0.0
+        st.rerun()
 
 with upload_tab:
     uploaded_audio = st.file_uploader(

@@ -1,0 +1,293 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      color: #111827;
+    }
+    .panel {
+      border: 1px solid #d1d5db;
+      border-radius: 18px;
+      padding: 16px;
+      background: #ffffff;
+    }
+    .buttons {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    button {
+      border: 0;
+      border-radius: 999px;
+      cursor: pointer;
+      font-size: 16px;
+      font-weight: 700;
+      padding: 12px 22px;
+    }
+    #start {
+      background: #0f766e;
+      color: white;
+    }
+    #stop {
+      background: #e5e7eb;
+      color: #111827;
+    }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+    .status {
+      color: #64748b;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+    .live {
+      color: #dc2626;
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <div class="buttons">
+      <button id="start">START</button>
+      <button id="stop" disabled>STOP</button>
+    </div>
+    <div id="status" class="status">Ready. Click START and speak Ningbo dialect.</div>
+  </div>
+
+  <script>
+    const Streamlit = {
+      setComponentReady() {
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 },
+          "*"
+        );
+      },
+      setFrameHeight(height) {
+        window.parent.postMessage(
+          {
+            isStreamlitMessage: true,
+            type: "streamlit:setFrameHeight",
+            height: height || document.body.scrollHeight,
+          },
+          "*"
+        );
+      },
+      setComponentValue(value) {
+        window.parent.postMessage(
+          {
+            isStreamlitMessage: true,
+            type: "streamlit:setComponentValue",
+            value,
+            dataType: "json",
+          },
+          "*"
+        );
+      },
+    };
+
+    const TARGET_SAMPLE_RATE = 16000;
+    const startButton = document.getElementById("start");
+    const stopButton = document.getElementById("stop");
+    const statusEl = document.getElementById("status");
+
+    let stream = null;
+    let audioContext = null;
+    let source = null;
+    let processor = null;
+    let flushTimer = null;
+    let buffers = [];
+    let sourceSampleRate = 48000;
+    let chunkId = 0;
+    let sessionId = "";
+    let startedAt = 0;
+
+    function setStatus(message, isLive = false) {
+      statusEl.innerHTML = isLive ? `<span class="live">● LIVE</span> ${message}` : message;
+      Streamlit.setFrameHeight();
+    }
+
+    function mergeBuffers(chunks) {
+      const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
+      const merged = new Float32Array(length);
+      let offset = 0;
+      for (const chunk of chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return merged;
+    }
+
+    function downsampleBuffer(buffer, inputRate, outputRate) {
+      if (inputRate === outputRate) {
+        return buffer;
+      }
+      const ratio = inputRate / outputRate;
+      const newLength = Math.round(buffer.length / ratio);
+      const result = new Float32Array(newLength);
+      let offsetResult = 0;
+      let offsetBuffer = 0;
+      while (offsetResult < result.length) {
+        const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+        let accum = 0;
+        let count = 0;
+        for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+          accum += buffer[i];
+          count++;
+        }
+        result[offsetResult] = count ? accum / count : 0;
+        offsetResult++;
+        offsetBuffer = nextOffsetBuffer;
+      }
+      return result;
+    }
+
+    function encodeWav(samples, sampleRate) {
+      const buffer = new ArrayBuffer(44 + samples.length * 2);
+      const view = new DataView(buffer);
+
+      function writeString(offset, value) {
+        for (let i = 0; i < value.length; i++) {
+          view.setUint8(offset + i, value.charCodeAt(i));
+        }
+      }
+
+      writeString(0, "RIFF");
+      view.setUint32(4, 36 + samples.length * 2, true);
+      writeString(8, "WAVE");
+      writeString(12, "fmt ");
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeString(36, "data");
+      view.setUint32(40, samples.length * 2, true);
+
+      let offset = 44;
+      for (let i = 0; i < samples.length; i++, offset += 2) {
+        const sample = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      }
+      return buffer;
+    }
+
+    function arrayBufferToBase64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = "";
+      const chunkSize = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+      }
+      return btoa(binary);
+    }
+
+    function flushChunk(isFinal = false) {
+      if (!buffers.length) {
+        if (isFinal) {
+          Streamlit.setComponentValue({ sessionId, isFinal: true, chunkId, wavBase64: "", durationSeconds: 0 });
+        }
+        return;
+      }
+
+      const merged = mergeBuffers(buffers);
+      buffers = [];
+      const downsampled = downsampleBuffer(merged, sourceSampleRate, TARGET_SAMPLE_RATE);
+      const wav = encodeWav(downsampled, TARGET_SAMPLE_RATE);
+      const durationSeconds = downsampled.length / TARGET_SAMPLE_RATE;
+      chunkId++;
+
+      Streamlit.setComponentValue({
+        sessionId,
+        chunkId,
+        isFinal,
+        wavBase64: arrayBufferToBase64(wav),
+        durationSeconds,
+      });
+
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      setStatus(`Recording... ${elapsed}s. Sent chunk ${chunkId}.`, true);
+    }
+
+    async function startRecording() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false,
+        });
+
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        sourceSampleRate = audioContext.sampleRate;
+        source = audioContext.createMediaStreamSource(stream);
+        processor = audioContext.createScriptProcessor(4096, 1, 1);
+        buffers = [];
+        chunkId = 0;
+        sessionId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        startedAt = Date.now();
+        Streamlit.setComponentValue({ sessionId, reset: true, chunkId: 0, wavBase64: "", durationSeconds: 0 });
+
+        processor.onaudioprocess = (event) => {
+          buffers.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+        };
+
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+        flushTimer = window.setInterval(() => flushChunk(false), 5000);
+
+        startButton.disabled = true;
+        stopButton.disabled = false;
+        setStatus("Recording... speak naturally.", true);
+      } catch (error) {
+        setStatus(`Microphone error: ${error.message || error}`);
+      }
+    }
+
+    async function stopRecording() {
+      if (flushTimer) {
+        window.clearInterval(flushTimer);
+        flushTimer = null;
+      }
+      flushChunk(true);
+
+      if (processor) {
+        processor.disconnect();
+        processor = null;
+      }
+      if (source) {
+        source.disconnect();
+        source = null;
+      }
+      if (audioContext) {
+        await audioContext.close();
+        audioContext = null;
+      }
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+        stream = null;
+      }
+
+      startButton.disabled = false;
+      stopButton.disabled = true;
+      setStatus("Stopped. Click START to begin a new transcript.");
+    }
+
+    startButton.addEventListener("click", startRecording);
+    stopButton.addEventListener("click", stopRecording);
+
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight();
+  </script>
+</body>
+</html>
