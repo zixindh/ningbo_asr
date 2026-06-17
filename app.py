@@ -338,9 +338,13 @@ def recognize_with_fun_asr(
     text = callback.final_text()
     if not text:
         request_id = recognition.get_last_request_id() or "N/A"
+        audio_note = ""
+        if prepared_audio.audio_format == "pcm":
+            duration_seconds, peak = pcm_audio_stats(audio_data)
+            audio_note = f" Captured audio: {duration_seconds:.1f}s, peak level {peak}."
         raise NoTranscriptError(
             "No Mandarin transcript was returned. Check microphone permission and try speaking for 3-5 seconds. "
-            f"Endpoint: {endpoint_name}. Request ID: {request_id}"
+            f"Endpoint: {endpoint_name}. Request ID: {request_id}.{audio_note}"
         )
 
     duration_seconds = prepared_audio.duration_seconds
