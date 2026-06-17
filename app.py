@@ -1,299 +1,434 @@
-"""Ningbo Dialect → Mandarin - Two-Pass Real-Time Transcription."""
-import streamlit as st
-from google import genai
-import tempfile
+"""Ningbo dialect to Mandarin text with Alibaba Fun-ASR realtime."""
+import audioop
+import html
+import io
 import os
+import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+import wave
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-st.set_page_config(page_title="宁波话转录", page_icon="🎙️", layout="centered")
+import dashscope
+import streamlit as st
+from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
 
-st.markdown("""
-<style>
-    .stApp { max-width: 700px; margin: 0 auto; background: #111827; }
-    [data-testid="stAudioInput"] { display: flex; justify-content: center; }
-    [data-testid="stAudioInput"] > div { min-height: 100px !important; }
-    [data-testid="stAudioInput"] button {
-        width: 90px !important; height: 90px !important;
-        border-radius: 50% !important; font-size: 1.6rem !important;
-        background: #3b82f6 !important; border: none !important;
-        transition: all 0.2s !important;
-    }
-    [data-testid="stAudioInput"] button:hover {
-        background: #2563eb !important; transform: scale(1.05);
-    }
-    
-    h1 { text-align: center; color: white; margin-bottom: 0.3rem; }
-    .sub { text-align: center; color: #9ca3af; margin-bottom: 1.5rem; }
-    
-    /* First pass - quick result */
-    .quick { 
-        background: #1e3a5f; color: #93c5fd; 
-        padding: 1rem; border-radius: 10px; margin: 0.5rem 0;
-        border-left: 4px solid #3b82f6; font-size: 1.1rem;
-    }
-    .quick-label { color: #60a5fa; font-size: 0.75rem; margin-bottom: 0.3rem; }
-    
-    /* Final result - refined */
-    .final { 
-        background: linear-gradient(135deg, #065f46 0%, #047857 100%);
-        color: white; padding: 1.2rem; border-radius: 12px; 
-        font-size: 1.3rem; text-align: center; margin: 0.8rem 0;
-        box-shadow: 0 4px 15px rgba(16,185,129,0.3);
-    }
-    .final-label { color: #34d399; font-size: 0.75rem; margin-bottom: 0.3rem; text-align: center; }
-    
-    /* Status */
-    .status { text-align: center; padding: 0.5rem; border-radius: 8px; margin: 0.5rem 0; }
-    .status-listening { background: #fef3c7; color: #92400e; }
-    .status-processing { background: #dbeafe; color: #1e40af; }
-    .status-refining { background: #d1fae5; color: #065f46; }
-    
-    /* History */
-    .history { 
-        background: #1f2937; padding: 0.8rem 1rem; border-radius: 8px;
-        margin: 0.3rem 0; border-left: 3px solid #4b5563; color: #d1d5db;
-    }
-    .time { color: #6b7280; font-size: 0.7rem; }
-</style>
-""", unsafe_allow_html=True)
 
-st.markdown("<h1>🎙️ 宁波话转录</h1>", unsafe_allow_html=True)
-st.markdown('<p class="sub">Ningbo Dialect Transcriber · 两步转写</p>', unsafe_allow_html=True)
+MODEL_NAME = "fun-asr-realtime"
+MAINLAND_WEBSOCKET_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+TARGET_SAMPLE_RATE = 16000
+CHUNK_SIZE_BYTES = 3200
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
+MAINLAND_PRICE_USD_PER_SECOND = 0.000047
+SUPPORTED_UPLOAD_TYPES = ["wav", "mp3", "aac", "amr", "opus", "speex"]
 
-# API key
-def get_api_key():
+
+@dataclass
+class PreparedAudio:
+    path: str
+    audio_format: str
+    duration_seconds: float
+    normalized: bool
+
+
+@dataclass
+class Transcript:
+    text: str
+    segments: list[str]
+    request_id: str
+    duration_seconds: float
+    first_package_delay_ms: int | None
+    last_package_delay_ms: int | None
+    estimated_cost_usd: float
+
+
+class FunAsrCallback(RecognitionCallback):
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+        self.final_sentences: list[str] = []
+        self.error_message: str | None = None
+
+    def on_event(self, result: RecognitionResult) -> None:
+        sentence = result.get_sentence()
+        text = str(sentence.get("text", "")).strip()
+        if not text:
+            return
+
+        is_sentence_end = RecognitionResult.is_sentence_end(sentence)
+        self.events.append({"text": text, "is_sentence_end": is_sentence_end})
+        if is_sentence_end:
+            self.final_sentences.append(text)
+
+    def on_error(self, result: RecognitionResult) -> None:
+        self.error_message = getattr(result, "message", str(result))
+
+    def final_text(self) -> str:
+        if self.final_sentences:
+            return " ".join(self.final_sentences).strip()
+        if self.events:
+            return str(self.events[-1]["text"]).strip()
+        return ""
+
+    def segment_texts(self) -> list[str]:
+        if self.final_sentences:
+            return self.final_sentences
+        return [str(event["text"]) for event in self.events]
+
+
+def get_secret(name: str) -> str:
     try:
-        return st.secrets.get("GEMINI_API_KEY")
+        value = st.secrets.get(name, "")
     except Exception:
-        return os.environ.get("GEMINI_API_KEY")
+        value = ""
+    return str(value or os.environ.get(name, "")).strip()
 
-api_key = get_api_key()
-if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
-    api_key = st.text_input("🔑 API Key", type="password")
+
+def wav_to_mono_16k(raw_audio: bytes) -> tuple[bytes, float]:
+    with wave.open(io.BytesIO(raw_audio), "rb") as source:
+        channels = source.getnchannels()
+        sample_width = source.getsampwidth()
+        frame_rate = source.getframerate()
+        frames = source.readframes(source.getnframes())
+
+    if channels > 1:
+        frames = audioop.tomono(frames, sample_width, 0.5, 0.5)
+        channels = 1
+
+    if sample_width != 2:
+        frames = audioop.lin2lin(frames, sample_width, 2)
+        sample_width = 2
+
+    if frame_rate != TARGET_SAMPLE_RATE:
+        frames, _ = audioop.ratecv(
+            frames,
+            sample_width,
+            channels,
+            frame_rate,
+            TARGET_SAMPLE_RATE,
+            None,
+        )
+
+    duration_seconds = len(frames) / (TARGET_SAMPLE_RATE * sample_width)
+    output = io.BytesIO()
+    with wave.open(output, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(TARGET_SAMPLE_RATE)
+        target.writeframes(frames)
+
+    return output.getvalue(), duration_seconds
+
+
+def write_temp_audio(raw_audio: bytes, suffix: str) -> str:
+    # SECURITY-REVIEW: Uploaded audio bytes are isolated in a temp file and deleted after ASR.
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
+        temp_audio.write(raw_audio)
+        return temp_audio.name
+
+
+def prepare_audio(uploaded_file: Any) -> PreparedAudio:
+    raw_audio = uploaded_file.getvalue()
+    if not raw_audio:
+        raise ValueError("Audio file is empty.")
+    if len(raw_audio) > MAX_AUDIO_BYTES:
+        raise ValueError("Audio file is larger than the 25 MB app limit.")
+
+    suffix = Path(getattr(uploaded_file, "name", "") or "recording.wav").suffix.lower()
+    if suffix not in {f".{audio_type}" for audio_type in SUPPORTED_UPLOAD_TYPES}:
+        suffix = ".wav"
+
+    if suffix == ".wav":
+        try:
+            normalized_audio, duration_seconds = wav_to_mono_16k(raw_audio)
+            return PreparedAudio(
+                path=write_temp_audio(normalized_audio, ".wav"),
+                audio_format="wav",
+                duration_seconds=duration_seconds,
+                normalized=True,
+            )
+        except wave.Error as error:
+            raise ValueError("WAV audio must be PCM encoded.") from error
+
+    duration_seconds = 0.0
+    return PreparedAudio(
+        path=write_temp_audio(raw_audio, suffix),
+        audio_format=suffix.removeprefix("."),
+        duration_seconds=duration_seconds,
+        normalized=False,
+    )
+
+
+def recognize_with_fun_asr(
+    prepared_audio: PreparedAudio,
+    api_key: str,
+    semantic_punctuation_enabled: bool,
+    max_sentence_silence: int,
+    throttle_stream: bool,
+) -> Transcript:
+    dashscope.api_key = api_key
+    dashscope.base_websocket_api_url = MAINLAND_WEBSOCKET_URL
+
+    callback = FunAsrCallback()
+    recognition = Recognition(
+        model=MODEL_NAME,
+        format=prepared_audio.audio_format,
+        sample_rate=TARGET_SAMPLE_RATE,
+        language_hints=["zh"],
+        semantic_punctuation_enabled=semantic_punctuation_enabled,
+        max_sentence_silence=max_sentence_silence,
+        callback=callback,
+    )
+
+    with open(prepared_audio.path, "rb") as audio_file:
+        audio_data = audio_file.read()
+
+    if not audio_data:
+        raise ValueError("Prepared audio file is empty.")
+
+    progress = st.progress(0, text="Connecting to Fun-ASR Beijing endpoint...")
+    recognition.start()
+    total_bytes = len(audio_data)
+
+    for offset in range(0, total_bytes, CHUNK_SIZE_BYTES):
+        chunk = audio_data[offset : offset + CHUNK_SIZE_BYTES]
+        recognition.send_audio_frame(chunk)
+        progress.progress(
+            min(1.0, (offset + len(chunk)) / total_bytes),
+            text="Streaming audio to Fun-ASR...",
+        )
+        if throttle_stream:
+            time.sleep(0.1)
+
+    progress.progress(1.0, text="Finalizing transcript...")
+    recognition.stop()
+    progress.empty()
+
+    if callback.error_message:
+        raise RuntimeError(callback.error_message)
+
+    text = callback.final_text()
+    if not text:
+        response = recognition.get_response()
+        raise RuntimeError(f"No transcript returned. Response: {response}")
+
+    duration_seconds = prepared_audio.duration_seconds
+    if not duration_seconds and throttle_stream:
+        duration_seconds = max(1.0, total_bytes / CHUNK_SIZE_BYTES * 0.1)
+
+    return Transcript(
+        text=text,
+        segments=callback.segment_texts(),
+        request_id=recognition.get_last_request_id(),
+        duration_seconds=duration_seconds,
+        first_package_delay_ms=recognition.get_first_package_delay(),
+        last_package_delay_ms=recognition.get_last_package_delay(),
+        estimated_cost_usd=duration_seconds * MAINLAND_PRICE_USD_PER_SECOND,
+    )
+
+
+def transcribe(uploaded_file: Any, api_key: str) -> Transcript:
+    prepared_audio = prepare_audio(uploaded_file)
+    try:
+        return recognize_with_fun_asr(
+            prepared_audio=prepared_audio,
+            api_key=api_key,
+            semantic_punctuation_enabled=st.session_state.semantic_punctuation_enabled,
+            max_sentence_silence=st.session_state.max_sentence_silence,
+            throttle_stream=st.session_state.throttle_stream,
+        )
+    finally:
+        if os.path.exists(prepared_audio.path):
+            os.unlink(prepared_audio.path)
+
+
+def add_history(source: str, transcript: Transcript) -> None:
+    st.session_state.history.insert(
+        0,
+        {
+            "source": source,
+            "text": transcript.text,
+            "segments": transcript.segments,
+            "request_id": transcript.request_id,
+            "duration_seconds": transcript.duration_seconds,
+            "estimated_cost_usd": transcript.estimated_cost_usd,
+            "time": time.strftime("%H:%M:%S"),
+        },
+    )
+
+
+def render_transcript(transcript: Transcript) -> None:
+    escaped_text = html.escape(transcript.text)
+    st.markdown(
+        f"""
+        <div class="result-card">
+            <div class="result-label">普通话文本</div>
+            <div class="result-text">{escaped_text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    metrics = [
+        ("音频时长", f"{transcript.duration_seconds:.1f}s" if transcript.duration_seconds else "未知"),
+        ("预估费用", f"${transcript.estimated_cost_usd:.6f}"),
+        ("Request ID", transcript.request_id or "N/A"),
+    ]
+    columns = st.columns(3)
+    for column, (label, value) in zip(columns, metrics):
+        column.metric(label, value)
+
+    with st.expander("分句结果与延迟"):
+        for index, segment in enumerate(transcript.segments, 1):
+            st.write(f"{index}. {segment}")
+        st.caption(
+            f"First package: {transcript.first_package_delay_ms} ms · "
+            f"Last package: {transcript.last_package_delay_ms} ms"
+        )
+
+
+def init_state() -> None:
+    defaults = {
+        "history": [],
+        "semantic_punctuation_enabled": False,
+        "max_sentence_silence": 900,
+        "throttle_stream": True,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+st.set_page_config(page_title="宁波话转普通话", page_icon="🎙️", layout="centered")
+init_state()
+
+st.markdown(
+    """
+    <style>
+        .stApp { background: #f7f2e8; }
+        .hero {
+            padding: 1.4rem 1.2rem;
+            border-radius: 22px;
+            background: linear-gradient(135deg, #14213d 0%, #0f766e 100%);
+            color: white;
+            margin-bottom: 1rem;
+        }
+        .hero h1 { margin: 0; font-size: 2rem; }
+        .hero p { margin: 0.35rem 0 0; color: #dbeafe; }
+        .result-card {
+            padding: 1.2rem;
+            border-radius: 18px;
+            background: white;
+            border: 1px solid #e5e7eb;
+            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+            margin: 1rem 0;
+        }
+        .result-label {
+            color: #0f766e;
+            font-size: 0.82rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+        }
+        .result-text {
+            color: #111827;
+            font-size: 1.55rem;
+            line-height: 1.65;
+            margin-top: 0.5rem;
+        }
+        .history-item {
+            padding: 0.75rem 0;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .muted { color: #64748b; font-size: 0.85rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="hero">
+        <h1>宁波话 → 普通话</h1>
+        <p>Alibaba Model Studio · Fun-ASR Realtime · 中国大陆北京部署</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+api_key = get_secret("FUN_ASR_KEY")
+if not api_key:
+    st.info("请在 Streamlit Secrets 中设置 `FUN_ASR_KEY`，或在环境变量中设置同名 key。")
+    api_key = st.text_input("临时输入 FUN_ASR_KEY（不会保存）", type="password")
     if not api_key:
         st.stop()
 
-@st.cache_resource
-def get_client(_key):
-    return genai.Client(api_key=_key)
+with st.sidebar:
+    st.subheader("识别设置")
+    st.session_state.max_sentence_silence = st.slider(
+        "断句静音阈值（ms）",
+        min_value=200,
+        max_value=3000,
+        value=st.session_state.max_sentence_silence,
+        step=100,
+        help="宁波话句子较短时可调低；环境嘈杂或说话慢时可调高。",
+    )
+    st.session_state.semantic_punctuation_enabled = st.toggle(
+        "语义标点（更适合长段录音）",
+        value=st.session_state.semantic_punctuation_enabled,
+    )
+    st.session_state.throttle_stream = st.toggle(
+        "按实时速度发送音频",
+        value=st.session_state.throttle_stream,
+        help="更贴近 Fun-ASR realtime 的推荐用法；关闭后处理更快但长音频稳定性可能下降。",
+    )
+    st.caption("模型：fun-asr-realtime · Endpoint：dashscope.aliyuncs.com")
 
-client = get_client(api_key)
+record_tab, upload_tab = st.tabs(["现场录音", "上传音频"])
 
-VOCAB = "阿拉=我们,侬=你,伊=他她,格=这,勒海=在,呒没=没有,晓得=知道,交关/邪气=非常,老=很"
-
-# Session state
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "last_audio_id" not in st.session_state:
-    st.session_state.last_audio_id = None
-if "current_quick" not in st.session_state:
-    st.session_state.current_quick = None
-if "current_final" not in st.session_state:
-    st.session_state.current_final = None
-
-def quick_transcribe(file) -> str:
-    """First pass: FAST transcription for immediate understanding."""
-    return client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[f"宁波话音频，快速输出大概意思，用简短普通话。{VOCAB}", file]
-    ).text.strip()
-
-def refined_transcribe(file) -> dict:
-    """Second pass: Accurate parallel transcription."""
-    def raw():
-        return client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=["仔细听宁波话发音，用汉字记录，只输出汉字", file]
-        ).text.strip()
-    
-    def semantic():
-        return client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[f"宁波话音频。词汇:{VOCAB}。准确翻译成普通话，只输出结果", file]
-        ).text.strip()
-    
-    with ThreadPoolExecutor(2) as ex:
-        r, s = ex.submit(raw), ex.submit(semantic)
-    
-    # Final synthesis
-    final = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[f"综合两种宁波话转写，给出最准确的普通话翻译：\n音素记录:{r.result()}\n语义理解:{s.result()}\n参考词汇:{VOCAB}\n只输出最终翻译，不解释"]
-    ).text.strip()
-    
-    return {"raw": r.result(), "semantic": s.result(), "final": final}
-
-def two_pass_transcribe(audio_bytes: bytes):
-    """Two-pass transcription: quick first, refined second."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-        f.write(audio_bytes)
-        tmp = f.name
-    
-    try:
-        file = client.files.upload(file=tmp)
-        
-        # PASS 1: Quick (show immediately)
-        quick = quick_transcribe(file)
-        st.session_state.current_quick = quick
-        
-        # PASS 2: Refined (more accurate)
-        refined = refined_transcribe(file)
-        st.session_state.current_final = refined["final"]
-        
-        # Add to history
-        st.session_state.history.insert(0, {
-            "quick": quick,
-            "final": refined["final"],
-            "raw": refined["raw"],
-            "semantic": refined["semantic"],
-            "time": time.strftime("%H:%M:%S")
-        })
-        
-        return quick, refined
-        
-    finally:
-        os.path.exists(tmp) and os.unlink(tmp)
-
-# Audio input
-audio = st.audio_input("录音", label_visibility="collapsed")
-
-# Placeholders for real-time display
-status_ph = st.empty()
-quick_ph = st.empty()
-final_ph = st.empty()
-
-# Auto-transcribe when new audio
-if audio:
-    audio_id = id(audio)
-    if audio_id != st.session_state.last_audio_id:
-        st.session_state.last_audio_id = audio_id
-        st.session_state.current_quick = None
-        st.session_state.current_final = None
-        
-        # Show processing status
-        status_ph.markdown('<div class="status status-processing">⚡ 快速识别中...</div>', unsafe_allow_html=True)
-        
+with record_tab:
+    recorded_audio = st.audio_input("按住录音，说一段宁波话")
+    if recorded_audio and st.button("识别这段录音", type="primary"):
         try:
-            # Two-pass transcription
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-                f.write(audio.getvalue())
-                tmp = f.name
-            
-            file = client.files.upload(file=tmp)
-            
-            # PASS 1: Quick result
-            quick = quick_transcribe(file)
-            st.session_state.current_quick = quick
-            quick_ph.markdown(f'''
-                <div class="quick-label">⚡ 快速识别</div>
-                <div class="quick">{quick}</div>
-            ''', unsafe_allow_html=True)
-            
-            # Update status
-            status_ph.markdown('<div class="status status-refining">🔄 精确校正中...</div>', unsafe_allow_html=True)
-            
-            # PASS 2: Refined result
-            refined = refined_transcribe(file)
-            st.session_state.current_final = refined["final"]
-            
-            # Clear status, show final
-            status_ph.empty()
-            final_ph.markdown(f'''
-                <div class="final-label">✅ 精确翻译</div>
-                <div class="final">{refined["final"]}</div>
-            ''', unsafe_allow_html=True)
-            
-            # Add to history
-            st.session_state.history.insert(0, {
-                "quick": quick,
-                "final": refined["final"],
-                "raw": refined["raw"],
-                "semantic": refined["semantic"],
-                "time": time.strftime("%H:%M:%S")
-            })
-            
-            # Cleanup
-            os.path.exists(tmp) and os.unlink(tmp)
-            
-        except Exception as e:
-            status_ph.error(f"错误: {e}")
+            with st.spinner("正在识别宁波话..."):
+                transcript = transcribe(recorded_audio, api_key)
+            add_history("录音", transcript)
+            render_transcript(transcript)
+        except Exception as error:
+            st.error(f"识别失败：{error}")
 
-# Show current results if available (after rerun)
-elif st.session_state.current_quick:
-    quick_ph.markdown(f'''
-        <div class="quick-label">⚡ 快速识别</div>
-        <div class="quick">{st.session_state.current_quick}</div>
-    ''', unsafe_allow_html=True)
-    
-    if st.session_state.current_final:
-        final_ph.markdown(f'''
-            <div class="final-label">✅ 精确翻译</div>
-            <div class="final">{st.session_state.current_final}</div>
-        ''', unsafe_allow_html=True)
+with upload_tab:
+    uploaded_audio = st.file_uploader(
+        "上传 Fun-ASR 支持的音频",
+        type=SUPPORTED_UPLOAD_TYPES,
+        help="推荐 WAV；录音会自动转为 16 kHz 单声道 PCM WAV。",
+    )
+    if uploaded_audio and st.button("识别上传文件", type="primary"):
+        try:
+            with st.spinner("正在上传并流式识别..."):
+                transcript = transcribe(uploaded_audio, api_key)
+            add_history("上传", transcript)
+            render_transcript(transcript)
+        except Exception as error:
+            st.error(f"识别失败：{error}")
 
-# Details expander
 if st.session_state.history:
-    with st.expander("📊 详细分析"):
-        latest = st.session_state.history[0]
-        col1, col2 = st.columns(2)
-        with col1:
-            st.caption("音素记录")
-            st.code(latest.get("raw", ""))
-        with col2:
-            st.caption("语义理解")
-            st.code(latest.get("semantic", ""))
-
-# History
-if len(st.session_state.history) > 1:
-    st.markdown("---")
-    st.caption(f"📜 历史记录 ({len(st.session_state.history)})")
-    for item in st.session_state.history[1:8]:
-        st.markdown(f'''
-            <div class="history">
-                <span class="time">{item["time"]}</span> 
-                <strong>{item["final"]}</strong>
-                <br><small style="color:#6b7280">快速: {item["quick"]}</small>
+    st.markdown("### 最近结果")
+    for item in st.session_state.history[:8]:
+        st.markdown(
+            f"""
+            <div class="history-item">
+                <strong>{html.escape(item["text"])}</strong><br>
+                <span class="muted">{item["time"]} · {item["source"]} · request {item["request_id"]}</span>
             </div>
-        ''', unsafe_allow_html=True)
-    
+            """,
+            unsafe_allow_html=True,
+        )
+
     if st.button("清除历史"):
         st.session_state.history = []
-        st.session_state.last_audio_id = None
-        st.session_state.current_quick = None
-        st.session_state.current_final = None
         st.rerun()
 
-# File upload
-with st.expander("📁 上传文件"):
-    uploaded = st.file_uploader("文件", type=["mp3","wav","m4a","webm"], label_visibility="collapsed")
-    if uploaded:
-        st.session_state.last_audio_id = None  # Reset to trigger processing
-        # Process same as audio input
-        with st.spinner("处理中..."):
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-                    f.write(uploaded.getvalue())
-                    tmp = f.name
-                
-                file = client.files.upload(file=tmp)
-                quick = quick_transcribe(file)
-                refined = refined_transcribe(file)
-                
-                st.session_state.current_quick = quick
-                st.session_state.current_final = refined["final"]
-                st.session_state.history.insert(0, {
-                    "quick": quick,
-                    "final": refined["final"],
-                    "raw": refined["raw"],
-                    "semantic": refined["semantic"],
-                    "time": time.strftime("%H:%M:%S")
-                })
-                
-                os.path.exists(tmp) and os.unlink(tmp)
-                st.rerun()
-            except Exception as e:
-                st.error(f"错误: {e}")
-
-st.markdown("---")
-st.markdown('<p style="text-align:center;color:#6b7280;font-size:0.8rem;">Powered by Gemini AI · 两步转写系统</p>', unsafe_allow_html=True)
+st.caption(
+    "Pricing estimate uses Chinese Mainland Fun-ASR realtime rate "
+    f"(${MAINLAND_PRICE_USD_PER_SECOND}/second). Actual billing is determined by Alibaba Cloud."
+)

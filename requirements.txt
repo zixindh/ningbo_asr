@@ -1,2 +1,2 @@
 streamlit>=1.40.0
-google-genai>=1.0.0
+dashscope>=1.23.1
