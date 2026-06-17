@@ -118,6 +118,11 @@ def get_secret(name: str) -> str:
 
 
 def get_fun_asr_key() -> str:
+    region = get_secret("FUN_ASR_REGION").lower()
+    if region in {"mainland", "china", "beijing", "cn"}:
+        return get_secret("FUN_ASR_KEY")
+    if region in {"international", "intl", "singapore", "sg"}:
+        return get_secret("FUN_ASR_SG_KEY") or get_secret("FUN_ASR_KEY")
     return get_secret("FUN_ASR_SG_KEY") or get_secret("FUN_ASR_KEY")
 
 
@@ -137,6 +142,10 @@ def normalize_websocket_url(value: str) -> str:
 
 
 def get_fun_asr_endpoints() -> list[tuple[str, str]]:
+    region = get_secret("FUN_ASR_REGION").lower()
+    if region in {"mainland", "china", "beijing", "cn"}:
+        return [("mainland", MAINLAND_WEBSOCKET_URL)]
+
     custom_url = normalize_websocket_url(
         get_secret("FUN_ASR_WEBSOCKET_URL")
         or get_secret("FUN_ASR_API_HOST")
@@ -145,15 +154,12 @@ def get_fun_asr_endpoints() -> list[tuple[str, str]]:
     if custom_url:
         return [("custom", custom_url)]
 
-    region = get_secret("FUN_ASR_REGION").lower()
-    if get_secret("FUN_ASR_SG_KEY"):
+    if region in {"international", "intl", "singapore", "sg"}:
         return [
             ("singapore-maas", SINGAPORE_MAAS_WEBSOCKET_URL),
             ("international", INTERNATIONAL_WEBSOCKET_URL),
         ]
-    if region in {"mainland", "china", "beijing", "cn"}:
-        return [("mainland", MAINLAND_WEBSOCKET_URL)]
-    if region in {"international", "intl", "singapore", "sg"}:
+    if get_secret("FUN_ASR_SG_KEY"):
         return [
             ("singapore-maas", SINGAPORE_MAAS_WEBSOCKET_URL),
             ("international", INTERNATIONAL_WEBSOCKET_URL),
@@ -312,25 +318,16 @@ def recognize_with_fun_asr(
     if not audio_data:
         raise ValueError("Prepared audio file is empty.")
 
-    progress = st.progress(0, text=f"Connecting to Fun-ASR {endpoint_name} endpoint...")
-    try:
-        recognition.start()
-        total_bytes = len(audio_data)
+    recognition.start()
+    total_bytes = len(audio_data)
 
-        for offset in range(0, total_bytes, CHUNK_SIZE_BYTES):
-            chunk = audio_data[offset : offset + CHUNK_SIZE_BYTES]
-            recognition.send_audio_frame(chunk)
-            progress.progress(
-                min(1.0, (offset + len(chunk)) / total_bytes),
-                text="Streaming audio to Fun-ASR...",
-            )
-            if throttle_stream:
-                time.sleep(0.1)
+    for offset in range(0, total_bytes, CHUNK_SIZE_BYTES):
+        chunk = audio_data[offset : offset + CHUNK_SIZE_BYTES]
+        recognition.send_audio_frame(chunk)
+        if throttle_stream:
+            time.sleep(0.1)
 
-        progress.progress(1.0, text="Finalizing transcript...")
-        recognition.stop()
-    finally:
-        progress.empty()
+    recognition.stop()
 
     if callback.error():
         raise RuntimeError(callback.error())
@@ -399,12 +396,11 @@ class BrowserAudioFile:
 
 def render_stitched_transcript() -> None:
     stitched_text = " ".join(st.session_state.chunk_texts).strip()
-    visible_text = stitched_text or "Mandarin transcript will appear here."
+    visible_text = stitched_text or ""
 
     st.markdown(
         f"""
         <div class="transcript">
-            <div class="transcript-label">Mandarin text</div>
             <div class="result-text">{html.escape(visible_text)}</div>
         </div>
         """,
@@ -442,8 +438,7 @@ def transcribe_browser_chunk(chunk_data: dict[str, Any], api_key: str) -> None:
 
     audio_file = BrowserAudioFile(audio_bytes, f"chunk-{chunk_id}.{audio_format}")
 
-    with st.spinner("Transcribing..."):
-        transcript = transcribe(audio_file, api_key, throttle_stream=True)
+    transcript = transcribe(audio_file, api_key, throttle_stream=True)
 
     st.session_state.processed_chunk_ids.add(processed_key)
     if transcript.text:
@@ -473,54 +468,36 @@ st.markdown(
         }
         .block-container {
             max-width: 760px;
-            padding-top: 2.75rem;
-            padding-bottom: 2rem;
-        }
-        h1 {
-            color: #111827;
-            font-size: 2.35rem !important;
-            line-height: 1.1 !important;
-            margin-bottom: 0.25rem !important;
-        }
-        .subtitle {
-            color: #4b5563;
-            font-size: 1rem;
-            line-height: 1.6;
-            margin-bottom: 1.5rem;
+            padding-top: 0.85rem;
+            padding-bottom: 1rem;
         }
         .transcript {
             background: #ffffff;
             border: 1px solid #e5e7eb;
             border-radius: 8px;
-            margin-top: 1.25rem;
-            min-height: 220px;
-            padding: 1.25rem;
-        }
-        .transcript-label {
-            color: #6b7280;
-            font-size: 0.78rem;
-            font-weight: 700;
-            letter-spacing: 0;
-            text-transform: uppercase;
+            margin-top: 0.65rem;
+            min-height: 320px;
+            padding: 0.85rem;
         }
         .result-text {
             color: #111827;
-            font-size: 1.75rem;
-            line-height: 1.7;
-            margin-top: 0.75rem;
+            font-size: 1.05rem;
+            line-height: 1.6;
             word-break: break-word;
+            white-space: pre-wrap;
         }
-        .clear-button {
-            margin-top: 0.75rem;
+        @media (max-width: 640px) {
+            .block-container {
+                padding-left: 0.8rem;
+                padding-right: 0.8rem;
+            }
+            .result-text {
+                font-size: 0.98rem;
+                line-height: 1.55;
+            }
         }
     </style>
     """,
-    unsafe_allow_html=True,
-)
-
-st.title("Ningbo → Mandarin")
-st.markdown(
-    '<div class="subtitle">Press Start, speak Ningbo/Wu, then read the Mandarin text.</div>',
     unsafe_allow_html=True,
 )
 
@@ -539,10 +516,3 @@ if chunk_data:
             st.error(f"Recognition failed: {error}")
 
 render_stitched_transcript()
-
-if st.session_state.chunk_texts:
-    if st.button("Clear text"):
-        st.session_state.processed_chunk_ids = set()
-        st.session_state.chunk_texts = []
-        st.session_state.total_chunk_seconds = 0.0
-        st.rerun()

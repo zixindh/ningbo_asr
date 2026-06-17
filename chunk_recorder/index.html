@@ -106,8 +106,10 @@
     let audioContext = null;
     let source = null;
     let processor = null;
+    let flushTimer = null;
     let buffers = [];
     let sourceSampleRate = 48000;
+    let chunkId = 0;
     let sessionId = "";
     let startedAt = 0;
 
@@ -173,9 +175,11 @@
       return btoa(binary);
     }
 
-    function finishRecording() {
+    function flushChunk(isFinal = false) {
       if (!buffers.length) {
-        Streamlit.setComponentValue({ sessionId, reset: true, isFinal: true, chunkId: 1, pcmBase64: "", durationSeconds: 0 });
+        if (isFinal) {
+          Streamlit.setComponentValue({ sessionId, isFinal: true, chunkId, pcmBase64: "", durationSeconds: 0 });
+        }
         return;
       }
 
@@ -184,17 +188,19 @@
       const downsampled = downsampleBuffer(merged, sourceSampleRate, TARGET_SAMPLE_RATE);
       const pcm = encodePcm16(downsampled);
       const durationSeconds = downsampled.length / TARGET_SAMPLE_RATE;
+      chunkId++;
 
       Streamlit.setComponentValue({
         sessionId,
-        reset: true,
-        chunkId: 1,
-        isFinal: true,
+        reset: chunkId === 1,
+        chunkId,
+        isFinal,
         pcmBase64: arrayBufferToBase64(pcm),
         durationSeconds,
       });
 
-      setStatus(`Stopped. Processing ${durationSeconds.toFixed(1)}s of audio...`);
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      setStatus(`Recording... ${elapsed}s`, true);
     }
 
     async function startRecording() {
@@ -220,6 +226,7 @@
         source = audioContext.createMediaStreamSource(stream);
         processor = audioContext.createScriptProcessor(4096, 1, 1);
         buffers = [];
+        chunkId = 0;
         sessionId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         startedAt = Date.now();
 
@@ -229,6 +236,7 @@
 
         source.connect(processor);
         processor.connect(audioContext.destination);
+        flushTimer = window.setInterval(() => flushChunk(false), 5000);
 
         startButton.disabled = true;
         stopButton.disabled = false;
@@ -239,7 +247,11 @@
     }
 
     async function stopRecording() {
-      finishRecording();
+      if (flushTimer) {
+        window.clearInterval(flushTimer);
+        flushTimer = null;
+      }
+      flushChunk(true);
 
       if (processor) {
         processor.disconnect();
