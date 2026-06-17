@@ -510,8 +510,12 @@ def transcribe_browser_chunk(chunk_data: dict[str, Any], api_key: str, endpoints
     if audio_format == "pcm":
         duration_seconds, peak = pcm_audio_stats(audio_bytes)
         if duration_seconds < MIN_BROWSER_AUDIO_SECONDS:
+            if chunk_data.get("isFinal"):
+                return
             raise RuntimeError("Recording was too short. Press Start, speak for a few seconds, then press Stop.")
         if peak < MIN_BROWSER_AUDIO_PEAK:
+            if chunk_data.get("isFinal"):
+                return
             raise RuntimeError("The browser sent near-silent audio. Check the microphone permission/input and try again.")
 
     st.session_state.processed_chunk_ids.add(processed_key)
