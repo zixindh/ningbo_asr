@@ -21,6 +21,8 @@ from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionRes
 MODEL_NAME = "fun-asr-realtime"
 MAINLAND_WEBSOCKET_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 INTERNATIONAL_WEBSOCKET_URL = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference"
+SINGAPORE_MAAS_API_HOST = "ws-f6jqz1vpb4gjfvhw.ap-southeast-1.maas.aliyuncs.com"
+SINGAPORE_MAAS_WEBSOCKET_URL = f"wss://{SINGAPORE_MAAS_API_HOST}/api-ws/v1/inference"
 TARGET_SAMPLE_RATE = 16000
 CHUNK_SIZE_BYTES = 3200
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
@@ -77,8 +79,16 @@ class FunAsrCallback(RecognitionCallback):
                 self.final_sentences.append(text)
 
     def on_error(self, result: RecognitionResult) -> None:
+        message = getattr(result, "message", None)
+        request_id = getattr(result, "request_id", None) or getattr(result, "get_request_id", lambda: "")()
+        if not message:
+            sentence = result.get_sentence() if hasattr(result, "get_sentence") else {}
+            message = sentence.get("message") or sentence.get("error") or type(result).__name__
+        if request_id:
+            message = f"{message} (request_id: {request_id})"
+
         with self.lock:
-            self.error_message = getattr(result, "message", str(result))
+            self.error_message = str(message)
 
     def final_text(self) -> str:
         with self.lock:
@@ -107,19 +117,51 @@ def get_secret(name: str) -> str:
     return str(value or os.environ.get(name, "")).strip()
 
 
+def get_fun_asr_key() -> str:
+    return get_secret("FUN_ASR_SG_KEY") or get_secret("FUN_ASR_KEY")
+
+
+def normalize_websocket_url(value: str) -> str:
+    value = value.strip().rstrip("/")
+    if not value:
+        return ""
+
+    if value.startswith("ws://") or value.startswith("wss://"):
+        return value
+
+    if value.startswith("http://") or value.startswith("https://"):
+        host = value.split("://", 1)[1].split("/", 1)[0]
+    else:
+        host = value.split("/", 1)[0]
+    return f"wss://{host}/api-ws/v1/inference"
+
+
 def get_fun_asr_endpoints() -> list[tuple[str, str]]:
-    custom_url = get_secret("FUN_ASR_WEBSOCKET_URL")
+    custom_url = normalize_websocket_url(
+        get_secret("FUN_ASR_WEBSOCKET_URL")
+        or get_secret("FUN_ASR_API_HOST")
+        or get_secret("FUN_ASR_DASHSCOPE_URL")
+    )
     if custom_url:
         return [("custom", custom_url)]
 
     region = get_secret("FUN_ASR_REGION").lower()
+    if get_secret("FUN_ASR_SG_KEY"):
+        return [
+            ("singapore-maas", SINGAPORE_MAAS_WEBSOCKET_URL),
+            ("international", INTERNATIONAL_WEBSOCKET_URL),
+        ]
     if region in {"mainland", "china", "beijing", "cn"}:
         return [("mainland", MAINLAND_WEBSOCKET_URL)]
     if region in {"international", "intl", "singapore", "sg"}:
-        return [("international", INTERNATIONAL_WEBSOCKET_URL)]
+        return [
+            ("singapore-maas", SINGAPORE_MAAS_WEBSOCKET_URL),
+            ("international", INTERNATIONAL_WEBSOCKET_URL),
+        ]
 
     # Streamlit Cloud Free runs outside mainland China, so try the international endpoint first.
     return [
+        ("singapore-maas", SINGAPORE_MAAS_WEBSOCKET_URL),
         ("international", INTERNATIONAL_WEBSOCKET_URL),
         ("mainland", MAINLAND_WEBSOCKET_URL),
     ]
@@ -478,9 +520,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-api_key = get_secret("FUN_ASR_KEY")
+api_key = get_fun_asr_key()
 if not api_key:
-    st.warning("FUN_ASR_KEY is missing in Streamlit Secrets.")
+    st.warning("FUN_ASR_SG_KEY or FUN_ASR_KEY is missing in Streamlit Secrets.")
 
 chunk_data = RECORDER_COMPONENT(key="ningbo-chunk-recorder", default=None)
 if chunk_data:
