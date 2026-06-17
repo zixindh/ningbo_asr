@@ -25,6 +25,7 @@ SINGAPORE_MAAS_API_HOST = "ws-f6jqz1vpb4gjfvhw.ap-southeast-1.maas.aliyuncs.com"
 SINGAPORE_MAAS_WEBSOCKET_URL = f"wss://{SINGAPORE_MAAS_API_HOST}/api-ws/v1/inference"
 TARGET_SAMPLE_RATE = 16000
 CHUNK_SIZE_BYTES = 3200
+FRAME_SEND_DELAY_SECONDS = 0.02
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 MAINLAND_PRICE_USD_PER_SECOND = 0.000047
 MIN_BROWSER_AUDIO_SECONDS = 1.0
@@ -325,7 +326,7 @@ def recognize_with_fun_asr(
         chunk = audio_data[offset : offset + CHUNK_SIZE_BYTES]
         recognition.send_audio_frame(chunk)
         if throttle_stream:
-            time.sleep(0.1)
+            time.sleep(FRAME_SEND_DELAY_SECONDS)
 
     recognition.stop()
 
@@ -505,7 +506,7 @@ api_key = get_fun_asr_key()
 if not api_key:
     st.warning("FUN_ASR_SG_KEY or FUN_ASR_KEY is missing in Streamlit Secrets.")
 
-chunk_data = RECORDER_COMPONENT(key="ningbo-chunk-recorder", default=None)
+chunk_data = RECORDER_COMPONENT(key="ningbo-chunk-recorder", default=None, height=132)
 if chunk_data:
     if not api_key and (chunk_data.get("pcmBase64") or chunk_data.get("wavBase64")):
         st.error("Recognition is paused until FUN_ASR_KEY is configured.")
