@@ -222,30 +222,36 @@ def recognize_with_fun_asr(
         raise ValueError("Prepared audio file is empty.")
 
     progress = st.progress(0, text="Connecting to Fun-ASR Beijing endpoint...")
-    recognition.start()
-    total_bytes = len(audio_data)
+    try:
+        recognition.start()
+        total_bytes = len(audio_data)
 
-    for offset in range(0, total_bytes, CHUNK_SIZE_BYTES):
-        chunk = audio_data[offset : offset + CHUNK_SIZE_BYTES]
-        recognition.send_audio_frame(chunk)
-        progress.progress(
-            min(1.0, (offset + len(chunk)) / total_bytes),
-            text="Streaming audio to Fun-ASR...",
-        )
-        if throttle_stream:
-            time.sleep(0.1)
+        for offset in range(0, total_bytes, CHUNK_SIZE_BYTES):
+            chunk = audio_data[offset : offset + CHUNK_SIZE_BYTES]
+            recognition.send_audio_frame(chunk)
+            progress.progress(
+                min(1.0, (offset + len(chunk)) / total_bytes),
+                text="Streaming audio to Fun-ASR...",
+            )
+            if throttle_stream:
+                time.sleep(0.1)
 
-    progress.progress(1.0, text="Finalizing transcript...")
-    recognition.stop()
-    progress.empty()
+        progress.progress(1.0, text="Finalizing transcript...")
+        recognition.stop()
+    finally:
+        progress.empty()
 
     if callback.error():
         raise RuntimeError(callback.error())
 
     text = callback.final_text()
     if not text:
-        response = recognition.get_response()
-        raise RuntimeError(f"No transcript returned. Response: {response}")
+        request_id = recognition.get_last_request_id() or "N/A"
+        raise RuntimeError(
+            "No Mandarin transcript was returned. Please check that the microphone captured speech, "
+            "then try a short Ningbo/Wu phrase again. "
+            f"Request ID: {request_id}"
+        )
 
     duration_seconds = prepared_audio.duration_seconds
     if not duration_seconds and throttle_stream:
