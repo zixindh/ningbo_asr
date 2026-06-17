@@ -33,15 +33,15 @@ streamlit run app.py
 
 ## Usage
 
-1. Open the app and choose **连续录音**.
-2. Click **START** and allow browser microphone access.
-3. Speak Ningbo dialect directly. The browser records hidden 5-second chunks.
-4. The app transcribes each chunk and stitches the Mandarin text together.
-5. Click **STOP** when finished.
+1. Open the app.
+2. Click **Start** and allow browser microphone access.
+3. Speak Ningbo dialect / Wu Chinese.
+4. Read the Mandarin transcript as it appears.
+5. Click **Stop** when finished.
 
 ## Notes
 
 - Use a Chinese Mainland Alibaba Model Studio API key for this app.
-- Browser microphone chunks are processed in memory and sent directly to Fun-ASR.
+- The screen intentionally shows only Start, Stop, and the Mandarin transcript.
+- Browser microphone chunks are processed in memory and sent directly to Fun-ASR realtime.
 - This app does not require STUN, TURN, or WebRTC server settings.
-- Upload support is limited to Fun-ASR realtime formats: WAV, MP3, AAC, AMR, OPUS, SPEEX.
