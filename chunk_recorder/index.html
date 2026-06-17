@@ -106,10 +106,8 @@
     let audioContext = null;
     let source = null;
     let processor = null;
-    let flushTimer = null;
     let buffers = [];
     let sourceSampleRate = 48000;
-    let chunkId = 0;
     let sessionId = "";
     let startedAt = 0;
 
@@ -175,11 +173,9 @@
       return btoa(binary);
     }
 
-    function flushChunk(isFinal = false) {
+    function finishRecording() {
       if (!buffers.length) {
-        if (isFinal) {
-          Streamlit.setComponentValue({ sessionId, isFinal: true, chunkId, pcmBase64: "", durationSeconds: 0 });
-        }
+        Streamlit.setComponentValue({ sessionId, reset: true, isFinal: true, chunkId: 1, pcmBase64: "", durationSeconds: 0 });
         return;
       }
 
@@ -188,18 +184,17 @@
       const downsampled = downsampleBuffer(merged, sourceSampleRate, TARGET_SAMPLE_RATE);
       const pcm = encodePcm16(downsampled);
       const durationSeconds = downsampled.length / TARGET_SAMPLE_RATE;
-      chunkId++;
 
       Streamlit.setComponentValue({
         sessionId,
-        chunkId,
-        isFinal,
+        reset: true,
+        chunkId: 1,
+        isFinal: true,
         pcmBase64: arrayBufferToBase64(pcm),
         durationSeconds,
       });
 
-      const elapsed = Math.round((Date.now() - startedAt) / 1000);
-      setStatus(`Recording... ${elapsed}s. Sent chunk ${chunkId}.`, true);
+      setStatus(`Stopped. Processing ${durationSeconds.toFixed(1)}s of audio...`);
     }
 
     async function startRecording() {
@@ -220,14 +215,13 @@
         });
 
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        await audioContext.resume();
         sourceSampleRate = audioContext.sampleRate;
         source = audioContext.createMediaStreamSource(stream);
         processor = audioContext.createScriptProcessor(4096, 1, 1);
         buffers = [];
-        chunkId = 0;
         sessionId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         startedAt = Date.now();
-        Streamlit.setComponentValue({ sessionId, reset: true, chunkId: 0, pcmBase64: "", durationSeconds: 0 });
 
         processor.onaudioprocess = (event) => {
           buffers.push(new Float32Array(event.inputBuffer.getChannelData(0)));
@@ -235,7 +229,6 @@
 
         source.connect(processor);
         processor.connect(audioContext.destination);
-        flushTimer = window.setInterval(() => flushChunk(false), 5000);
 
         startButton.disabled = true;
         stopButton.disabled = false;
@@ -246,11 +239,7 @@
     }
 
     async function stopRecording() {
-      if (flushTimer) {
-        window.clearInterval(flushTimer);
-        flushTimer = null;
-      }
-      flushChunk(true);
+      finishRecording();
 
       if (processor) {
         processor.disconnect();

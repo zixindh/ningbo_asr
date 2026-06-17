@@ -24,6 +24,8 @@ TARGET_SAMPLE_RATE = 16000
 CHUNK_SIZE_BYTES = 3200
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 MAINLAND_PRICE_USD_PER_SECOND = 0.000047
+MIN_BROWSER_AUDIO_SECONDS = 1.0
+MIN_BROWSER_AUDIO_PEAK = 200
 SUPPORTED_UPLOAD_TYPES = ["pcm", "wav", "mp3", "aac", "amr", "opus", "speex"]
 RECORDER_COMPONENT = components.declare_component(
     "chunk_recorder",
@@ -162,6 +164,20 @@ def write_temp_audio(raw_audio: bytes, suffix: str) -> str:
         return temp_audio.name
 
 
+def pcm_audio_stats(raw_audio: bytes) -> tuple[float, int]:
+    if len(raw_audio) < 2:
+        return 0.0, 0
+
+    even_length = len(raw_audio) - (len(raw_audio) % 2)
+    samples = np.frombuffer(raw_audio[:even_length], dtype="<i2")
+    if not samples.size:
+        return 0.0, 0
+
+    duration_seconds = samples.size / TARGET_SAMPLE_RATE
+    peak = int(np.max(np.abs(samples.astype(np.int32))))
+    return duration_seconds, peak
+
+
 def prepare_audio(uploaded_file: Any) -> PreparedAudio:
     raw_audio = uploaded_file.getvalue()
     if not raw_audio:
@@ -174,10 +190,11 @@ def prepare_audio(uploaded_file: Any) -> PreparedAudio:
         suffix = ".wav"
 
     if suffix == ".pcm":
+        duration_seconds, _ = pcm_audio_stats(raw_audio)
         return PreparedAudio(
             path=write_temp_audio(raw_audio, ".pcm"),
             audio_format="pcm",
-            duration_seconds=len(raw_audio) / (TARGET_SAMPLE_RATE * 2),
+            duration_seconds=duration_seconds,
             normalized=False,
         )
 
@@ -217,7 +234,6 @@ def recognize_with_fun_asr(
         model=MODEL_NAME,
         format=prepared_audio.audio_format,
         sample_rate=TARGET_SAMPLE_RATE,
-        language_hints=["zh"],
         semantic_punctuation_enabled=semantic_punctuation_enabled,
         max_sentence_silence=max_sentence_silence,
         callback=callback,
@@ -316,23 +332,32 @@ def render_stitched_transcript() -> None:
 
 def transcribe_browser_chunk(chunk_data: dict[str, Any], api_key: str) -> None:
     session_id = str(chunk_data.get("sessionId") or "")
-    if chunk_data.get("reset") and session_id != st.session_state.current_recorder_session:
-        st.session_state.current_recorder_session = session_id
-        st.session_state.processed_chunk_ids = set()
-        st.session_state.chunk_texts = []
-        st.session_state.total_chunk_seconds = 0.0
-        return
-
     chunk_id = int(chunk_data.get("chunkId") or 0)
     pcm_base64 = str(chunk_data.get("pcmBase64") or "")
     wav_base64 = str(chunk_data.get("wavBase64") or "")
     audio_base64 = pcm_base64 or wav_base64
     audio_format = "pcm" if pcm_base64 else "wav"
+
+    if chunk_data.get("reset") and session_id != st.session_state.current_recorder_session:
+        st.session_state.current_recorder_session = session_id
+        st.session_state.processed_chunk_ids = set()
+        st.session_state.chunk_texts = []
+        st.session_state.total_chunk_seconds = 0.0
+        if not audio_base64:
+            return
+
     processed_key = f"{session_id}:{chunk_id}"
     if not chunk_id or not audio_base64 or processed_key in st.session_state.processed_chunk_ids:
         return
 
     audio_bytes = base64.b64decode(audio_base64)
+    if audio_format == "pcm":
+        duration_seconds, peak = pcm_audio_stats(audio_bytes)
+        if duration_seconds < MIN_BROWSER_AUDIO_SECONDS:
+            raise RuntimeError("Recording was too short. Press Start, speak for a few seconds, then press Stop.")
+        if peak < MIN_BROWSER_AUDIO_PEAK:
+            raise RuntimeError("The browser sent near-silent audio. Check the microphone permission/input and try again.")
+
     audio_file = BrowserAudioFile(audio_bytes, f"chunk-{chunk_id}.{audio_format}")
 
     with st.spinner("Transcribing..."):
