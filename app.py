@@ -24,7 +24,7 @@ TARGET_SAMPLE_RATE = 16000
 CHUNK_SIZE_BYTES = 3200
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 MAINLAND_PRICE_USD_PER_SECOND = 0.000047
-SUPPORTED_UPLOAD_TYPES = ["wav", "mp3", "aac", "amr", "opus", "speex"]
+SUPPORTED_UPLOAD_TYPES = ["pcm", "wav", "mp3", "aac", "amr", "opus", "speex"]
 RECORDER_COMPONENT = components.declare_component(
     "chunk_recorder",
     path=str(Path(__file__).parent / "chunk_recorder"),
@@ -173,6 +173,14 @@ def prepare_audio(uploaded_file: Any) -> PreparedAudio:
     if suffix not in {f".{audio_type}" for audio_type in SUPPORTED_UPLOAD_TYPES}:
         suffix = ".wav"
 
+    if suffix == ".pcm":
+        return PreparedAudio(
+            path=write_temp_audio(raw_audio, ".pcm"),
+            audio_format="pcm",
+            duration_seconds=len(raw_audio) / (TARGET_SAMPLE_RATE * 2),
+            normalized=False,
+        )
+
     if suffix == ".wav":
         try:
             normalized_audio, duration_seconds = wav_to_mono_16k(raw_audio)
@@ -248,8 +256,7 @@ def recognize_with_fun_asr(
     if not text:
         request_id = recognition.get_last_request_id() or "N/A"
         raise RuntimeError(
-            "No Mandarin transcript was returned. Please check that the microphone captured speech, "
-            "then try a short Ningbo/Wu phrase again. "
+            "No Mandarin transcript was returned. Check microphone permission and try speaking for 3-5 seconds. "
             f"Request ID: {request_id}"
         )
 
@@ -317,16 +324,19 @@ def transcribe_browser_chunk(chunk_data: dict[str, Any], api_key: str) -> None:
         return
 
     chunk_id = int(chunk_data.get("chunkId") or 0)
+    pcm_base64 = str(chunk_data.get("pcmBase64") or "")
     wav_base64 = str(chunk_data.get("wavBase64") or "")
+    audio_base64 = pcm_base64 or wav_base64
+    audio_format = "pcm" if pcm_base64 else "wav"
     processed_key = f"{session_id}:{chunk_id}"
-    if not chunk_id or not wav_base64 or processed_key in st.session_state.processed_chunk_ids:
+    if not chunk_id or not audio_base64 or processed_key in st.session_state.processed_chunk_ids:
         return
 
-    audio_bytes = base64.b64decode(wav_base64)
-    audio_file = BrowserAudioFile(audio_bytes, f"chunk-{chunk_id}.wav")
+    audio_bytes = base64.b64decode(audio_base64)
+    audio_file = BrowserAudioFile(audio_bytes, f"chunk-{chunk_id}.{audio_format}")
 
     with st.spinner("Transcribing..."):
-        transcript = transcribe(audio_file, api_key)
+        transcript = transcribe(audio_file, api_key, throttle_stream=True)
 
     st.session_state.processed_chunk_ids.add(processed_key)
     if transcript.text:
@@ -413,7 +423,7 @@ if not api_key:
 
 chunk_data = RECORDER_COMPONENT(key="ningbo-chunk-recorder", default=None)
 if chunk_data:
-    if not api_key and chunk_data.get("wavBase64"):
+    if not api_key and (chunk_data.get("pcmBase64") or chunk_data.get("wavBase64")):
         st.error("Recognition is paused until FUN_ASR_KEY is configured.")
     else:
         try:

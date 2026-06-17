@@ -43,5 +43,5 @@ streamlit run app.py
 
 - Use a Chinese Mainland Alibaba Model Studio API key for this app.
 - The screen intentionally shows only Start, Stop, and the Mandarin transcript.
-- Browser microphone chunks are processed in memory and sent directly to Fun-ASR realtime.
+- Browser microphone chunks are converted to 16 kHz mono PCM in the browser, processed in memory by Streamlit Cloud, and sent directly to Fun-ASR realtime.
 - This app does not require STUN, TURN, or WebRTC server settings.
