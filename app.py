@@ -1,5 +1,4 @@
 """Ningbo dialect to Mandarin text with Alibaba Fun-ASR realtime."""
-import audioop
 import html
 import io
 import os
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import dashscope
+import numpy as np
 import streamlit as st
 from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
 
@@ -89,33 +89,52 @@ def wav_to_mono_16k(raw_audio: bytes) -> tuple[bytes, float]:
         channels = source.getnchannels()
         sample_width = source.getsampwidth()
         frame_rate = source.getframerate()
+        frame_count = source.getnframes()
         frames = source.readframes(source.getnframes())
 
-    if channels > 1:
-        frames = audioop.tomono(frames, sample_width, 0.5, 0.5)
-        channels = 1
+    if sample_width == 1:
+        samples = np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128
+        max_value = 128.0
+    elif sample_width == 2:
+        samples = np.frombuffer(frames, dtype="<i2").astype(np.float32)
+        max_value = 32768.0
+    elif sample_width == 3:
+        raw = np.frombuffer(frames, dtype=np.uint8).reshape(-1, 3)
+        signed = (
+            raw[:, 0].astype(np.int32)
+            | (raw[:, 1].astype(np.int32) << 8)
+            | (raw[:, 2].astype(np.int32) << 16)
+        )
+        samples = ((signed << 8) >> 8).astype(np.float32)
+        max_value = 8388608.0
+    elif sample_width == 4:
+        samples = np.frombuffer(frames, dtype="<i4").astype(np.float32)
+        max_value = 2147483648.0
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sample_width} bytes.")
 
-    if sample_width != 2:
-        frames = audioop.lin2lin(frames, sample_width, 2)
-        sample_width = 2
+    samples = samples.reshape(-1, channels)
+    if channels > 1:
+        samples = samples.mean(axis=1)
+    else:
+        samples = samples[:, 0]
+
+    duration_seconds = frame_count / frame_rate
+    samples = samples / max_value
 
     if frame_rate != TARGET_SAMPLE_RATE:
-        frames, _ = audioop.ratecv(
-            frames,
-            sample_width,
-            channels,
-            frame_rate,
-            TARGET_SAMPLE_RATE,
-            None,
-        )
+        target_count = max(1, int(round(duration_seconds * TARGET_SAMPLE_RATE)))
+        source_positions = np.linspace(0.0, duration_seconds, num=len(samples), endpoint=False)
+        target_positions = np.linspace(0.0, duration_seconds, num=target_count, endpoint=False)
+        samples = np.interp(target_positions, source_positions, samples).astype(np.float32)
 
-    duration_seconds = len(frames) / (TARGET_SAMPLE_RATE * sample_width)
+    pcm16 = np.clip(samples * 32767.0, -32768, 32767).astype("<i2").tobytes()
     output = io.BytesIO()
     with wave.open(output, "wb") as target:
         target.setnchannels(1)
         target.setsampwidth(2)
         target.setframerate(TARGET_SAMPLE_RATE)
-        target.writeframes(frames)
+        target.writeframes(pcm16)
 
     return output.getvalue(), duration_seconds
 
