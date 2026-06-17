@@ -20,6 +20,7 @@ from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionRes
 
 MODEL_NAME = "fun-asr-realtime"
 MAINLAND_WEBSOCKET_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+INTERNATIONAL_WEBSOCKET_URL = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference"
 TARGET_SAMPLE_RATE = 16000
 CHUNK_SIZE_BYTES = 3200
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
@@ -31,6 +32,10 @@ RECORDER_COMPONENT = components.declare_component(
     "chunk_recorder",
     path=str(Path(__file__).parent / "chunk_recorder"),
 )
+
+
+class NoTranscriptError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -100,6 +105,24 @@ def get_secret(name: str) -> str:
     except Exception:
         value = ""
     return str(value or os.environ.get(name, "")).strip()
+
+
+def get_fun_asr_endpoints() -> list[tuple[str, str]]:
+    custom_url = get_secret("FUN_ASR_WEBSOCKET_URL")
+    if custom_url:
+        return [("custom", custom_url)]
+
+    region = get_secret("FUN_ASR_REGION").lower()
+    if region in {"mainland", "china", "beijing", "cn"}:
+        return [("mainland", MAINLAND_WEBSOCKET_URL)]
+    if region in {"international", "intl", "singapore", "sg"}:
+        return [("international", INTERNATIONAL_WEBSOCKET_URL)]
+
+    # Streamlit Cloud Free runs outside mainland China, so try the international endpoint first.
+    return [
+        ("international", INTERNATIONAL_WEBSOCKET_URL),
+        ("mainland", MAINLAND_WEBSOCKET_URL),
+    ]
 
 
 def wav_to_mono_16k(raw_audio: bytes) -> tuple[bytes, float]:
@@ -222,12 +245,14 @@ def prepare_audio(uploaded_file: Any) -> PreparedAudio:
 def recognize_with_fun_asr(
     prepared_audio: PreparedAudio,
     api_key: str,
+    endpoint_name: str,
+    endpoint_url: str,
     semantic_punctuation_enabled: bool,
     max_sentence_silence: int,
     throttle_stream: bool,
 ) -> Transcript:
     dashscope.api_key = api_key
-    dashscope.base_websocket_api_url = MAINLAND_WEBSOCKET_URL
+    dashscope.base_websocket_api_url = endpoint_url
 
     callback = FunAsrCallback()
     recognition = Recognition(
@@ -245,7 +270,7 @@ def recognize_with_fun_asr(
     if not audio_data:
         raise ValueError("Prepared audio file is empty.")
 
-    progress = st.progress(0, text="Connecting to Fun-ASR Beijing endpoint...")
+    progress = st.progress(0, text=f"Connecting to Fun-ASR {endpoint_name} endpoint...")
     try:
         recognition.start()
         total_bytes = len(audio_data)
@@ -271,9 +296,9 @@ def recognize_with_fun_asr(
     text = callback.final_text()
     if not text:
         request_id = recognition.get_last_request_id() or "N/A"
-        raise RuntimeError(
+        raise NoTranscriptError(
             "No Mandarin transcript was returned. Check microphone permission and try speaking for 3-5 seconds. "
-            f"Request ID: {request_id}"
+            f"Endpoint: {endpoint_name}. Request ID: {request_id}"
         )
 
     duration_seconds = prepared_audio.duration_seconds
@@ -294,13 +319,24 @@ def recognize_with_fun_asr(
 def transcribe(uploaded_file: Any, api_key: str, throttle_stream: bool = False) -> Transcript:
     prepared_audio = prepare_audio(uploaded_file)
     try:
-        return recognize_with_fun_asr(
-            prepared_audio=prepared_audio,
-            api_key=api_key,
-            semantic_punctuation_enabled=False,
-            max_sentence_silence=900,
-            throttle_stream=throttle_stream,
-        )
+        errors: list[str] = []
+        for endpoint_name, endpoint_url in get_fun_asr_endpoints():
+            try:
+                return recognize_with_fun_asr(
+                    prepared_audio=prepared_audio,
+                    api_key=api_key,
+                    endpoint_name=endpoint_name,
+                    endpoint_url=endpoint_url,
+                    semantic_punctuation_enabled=False,
+                    max_sentence_silence=900,
+                    throttle_stream=throttle_stream,
+                )
+            except NoTranscriptError as error:
+                errors.append(str(error))
+            except Exception as error:
+                errors.append(f"{endpoint_name}: {error}")
+
+        raise RuntimeError("Recognition did not return text from any configured endpoint. " + " | ".join(errors))
     finally:
         if os.path.exists(prepared_audio.path):
             os.unlink(prepared_audio.path)
