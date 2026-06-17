@@ -1,4 +1,4 @@
 streamlit>=1.40.0
 dashscope>=1.23.1
 numpy>=1.26.0
-streamlit-webrtc
+streamlit-webrtc==0.72.1

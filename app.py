@@ -27,6 +27,31 @@ MAINLAND_PRICE_USD_PER_SECOND = 0.000047
 SUPPORTED_UPLOAD_TYPES = ["wav", "mp3", "aac", "amr", "opus", "speex"]
 
 
+def patch_streamlit_webrtc_shutdown() -> None:
+    try:
+        from streamlit_webrtc import shutdown
+    except Exception:
+        return
+
+    observer_class = getattr(shutdown, "SessionShutdownObserver", None)
+    if not observer_class or getattr(observer_class, "_ningbo_patch_applied", False):
+        return
+
+    original_stop = observer_class.stop
+
+    def safe_stop(self: Any) -> Any:
+        polling_thread = getattr(self, "_polling_thread", None)
+        if polling_thread is None:
+            return None
+        return original_stop(self)
+
+    observer_class.stop = safe_stop
+    observer_class._ningbo_patch_applied = True
+
+
+patch_streamlit_webrtc_shutdown()
+
+
 @dataclass
 class PreparedAudio:
     path: str
