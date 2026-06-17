@@ -124,6 +124,88 @@ def get_secret(name: str) -> str:
     return str(value or os.environ.get(name, "")).strip()
 
 
+def get_bool_secret(name: str, default: bool = False) -> bool:
+    value = get_secret(name).lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "y", "on"}
+
+
+def get_int_secret(name: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    try:
+        value = int(get_secret(name) or default)
+    except ValueError:
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def get_float_secret(name: str) -> float | None:
+    raw_value = get_secret(name)
+    if not raw_value:
+        return None
+    try:
+        return float(raw_value)
+    except ValueError:
+        return None
+
+
+def get_fun_asr_model() -> str:
+    return get_secret("FUN_ASR_MODEL") or MODEL_NAME
+
+
+def get_language_hints() -> list[str] | None:
+    language_hint = get_secret("FUN_ASR_LANGUAGE_HINT") or "zh"
+    language_hint = language_hint.split(",", 1)[0].strip().lower()
+    if language_hint in {"", "auto", "none", "off", "false"}:
+        return None
+    return [language_hint]
+
+
+def get_semantic_punctuation_enabled() -> bool:
+    return get_bool_secret("FUN_ASR_SEMANTIC_PUNCTUATION", False)
+
+
+def get_max_sentence_silence() -> int:
+    return get_int_secret("FUN_ASR_MAX_SENTENCE_SILENCE_MS", 1300, 200, 6000)
+
+
+def get_multi_threshold_mode_enabled() -> bool:
+    return get_bool_secret("FUN_ASR_MULTI_THRESHOLD_MODE", False)
+
+
+def get_hotword_phrase_id() -> str:
+    return get_secret("FUN_ASR_PHRASE_ID") or get_secret("FUN_ASR_HOTWORD_PHRASE_ID")
+
+
+def get_recognition_kwargs(semantic_punctuation_enabled: bool) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "semantic_punctuation_enabled": semantic_punctuation_enabled,
+    }
+
+    language_hints = get_language_hints()
+    if language_hints:
+        kwargs["language_hints"] = language_hints
+
+    vocabulary_id = get_secret("FUN_ASR_VOCABULARY_ID") or get_secret("FUN_ASR_HOTWORD_ID")
+    if vocabulary_id:
+        kwargs["vocabulary_id"] = vocabulary_id
+
+    if not semantic_punctuation_enabled:
+        kwargs["max_sentence_silence"] = get_max_sentence_silence()
+        if get_multi_threshold_mode_enabled():
+            kwargs["multi_threshold_mode_enabled"] = True
+
+    speech_noise_threshold = get_float_secret("FUN_ASR_SPEECH_NOISE_THRESHOLD")
+    if speech_noise_threshold is not None:
+        kwargs["speech_noise_threshold"] = min(1.0, max(-1.0, speech_noise_threshold))
+
+    return kwargs
+
+
 def get_fun_asr_key() -> str:
     region = get_secret("FUN_ASR_REGION").lower()
     if region in {"mainland", "china", "beijing", "cn"}:
@@ -303,20 +385,19 @@ def recognize_with_fun_asr(
     endpoint_name: str,
     endpoint_url: str,
     semantic_punctuation_enabled: bool,
-    max_sentence_silence: int,
     throttle_stream: bool,
 ) -> Transcript:
     dashscope.api_key = api_key
     dashscope.base_websocket_api_url = endpoint_url
 
     callback = FunAsrCallback()
+    recognition_kwargs = get_recognition_kwargs(semantic_punctuation_enabled)
     recognition = Recognition(
-        model=MODEL_NAME,
+        model=get_fun_asr_model(),
         format=prepared_audio.audio_format,
         sample_rate=TARGET_SAMPLE_RATE,
-        semantic_punctuation_enabled=semantic_punctuation_enabled,
-        max_sentence_silence=max_sentence_silence,
         callback=callback,
+        **recognition_kwargs,
     )
 
     with open(prepared_audio.path, "rb") as audio_file:
@@ -325,7 +406,7 @@ def recognize_with_fun_asr(
     if not audio_data:
         raise ValueError("Prepared audio file is empty.")
 
-    recognition.start()
+    recognition.start(phrase_id=get_hotword_phrase_id() or None)
     total_bytes = len(audio_data)
 
     for offset in range(0, total_bytes, CHUNK_SIZE_BYTES):
@@ -391,8 +472,7 @@ def transcribe_prepared_audio(
                     api_key=api_key,
                     endpoint_name=endpoint_name,
                     endpoint_url=endpoint_url,
-                    semantic_punctuation_enabled=False,
-                    max_sentence_silence=900,
+                    semantic_punctuation_enabled=get_semantic_punctuation_enabled(),
                     throttle_stream=throttle_stream,
                 )
             except NoTranscriptError as error:
