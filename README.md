@@ -17,6 +17,14 @@ Add this secret in Streamlit Cloud:
 FUN_ASR_KEY = "your-alibaba-model-studio-key"
 ```
 
+For reliable live microphone connections, especially on restricted networks, add a TURN relay:
+
+```toml
+TURN_URLS = "turn:your-turn-host:3478,turns:your-turn-host:5349"
+TURN_USERNAME = "your-turn-username"
+TURN_CREDENTIAL = "your-turn-password"
+```
+
 You can also run locally with the same environment variable:
 
 ```powershell
@@ -42,4 +50,5 @@ streamlit run app.py
 
 - Use a Chinese Mainland Alibaba Model Studio API key for this app.
 - Live microphone frames are streamed directly to Fun-ASR and are not saved first.
+- Live microphone uses WebRTC. STUN is tried by default, but many corporate/mobile networks need TURN.
 - Upload support is limited to Fun-ASR realtime formats: WAV, MP3, AAC, AMR, OPUS, SPEEX.

@@ -25,6 +25,11 @@ CHUNK_SIZE_BYTES = 3200
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 MAINLAND_PRICE_USD_PER_SECOND = 0.000047
 SUPPORTED_UPLOAD_TYPES = ["wav", "mp3", "aac", "amr", "opus", "speex"]
+DEFAULT_ICE_SERVERS = [
+    {"urls": ["stun:stun.l.google.com:19302"]},
+    {"urls": ["stun:stun1.l.google.com:19302"]},
+    {"urls": ["stun:global.stun.twilio.com:3478"]},
+]
 
 
 def patch_streamlit_webrtc_shutdown() -> None:
@@ -119,6 +124,36 @@ def get_secret(name: str) -> str:
     except Exception:
         value = ""
     return str(value or os.environ.get(name, "")).strip()
+
+
+def split_secret_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def get_rtc_configuration() -> dict[str, Any]:
+    ice_servers = DEFAULT_ICE_SERVERS.copy()
+
+    turn_urls = split_secret_list(get_secret("TURN_URLS"))
+    turn_username = get_secret("TURN_USERNAME")
+    turn_credential = get_secret("TURN_CREDENTIAL")
+    if turn_urls and turn_username and turn_credential:
+        ice_servers.append(
+            {
+                "urls": turn_urls,
+                "username": turn_username,
+                "credential": turn_credential,
+            }
+        )
+
+    return {"iceServers": ice_servers}
+
+
+def has_turn_configuration() -> bool:
+    return bool(
+        split_secret_list(get_secret("TURN_URLS"))
+        and get_secret("TURN_USERNAME")
+        and get_secret("TURN_CREDENTIAL")
+    )
 
 
 def wav_to_mono_16k(raw_audio: bytes) -> tuple[bytes, float]:
@@ -571,17 +606,23 @@ with st.sidebar:
         help="只影响上传文件；实时麦克风会按真实语速发送。",
     )
     st.caption("模型：fun-asr-realtime · Endpoint：dashscope.aliyuncs.com")
+    if has_turn_configuration():
+        st.success("TURN relay configured for microphone connection.")
+    else:
+        st.warning("No TURN relay configured. Some networks may not connect with STUN only.")
 
 live_tab, upload_tab = st.tabs(["实时麦克风", "上传音频"])
 
 with live_tab:
     st.info("点击 START 并允许麦克风权限后，直接说宁波话（吴语）。文字会自动实时更新。")
+    if not has_turn_configuration():
+        st.caption("如果一直显示连接中，请在 Streamlit Secrets 添加 TURN relay 设置。上传音频仍可作为备用。")
     ctx = webrtc_streamer(
         key="ningbo-live-microphone",
         mode=WebRtcMode.SENDONLY,
         media_stream_constraints={"audio": True, "video": False},
         audio_receiver_size=1024,
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        rtc_configuration=get_rtc_configuration(),
     )
 
     if ctx.state.playing and ctx.audio_receiver:
