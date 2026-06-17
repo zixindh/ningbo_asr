@@ -2,7 +2,9 @@
 import html
 import io
 import os
+import queue
 import tempfile
+import threading
 import time
 import wave
 from dataclasses import dataclass
@@ -13,6 +15,7 @@ import dashscope
 import numpy as np
 import streamlit as st
 from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 
 MODEL_NAME = "fun-asr-realtime"
@@ -45,6 +48,7 @@ class Transcript:
 
 class FunAsrCallback(RecognitionCallback):
     def __init__(self) -> None:
+        self.lock = threading.Lock()
         self.events: list[dict[str, Any]] = []
         self.final_sentences: list[str] = []
         self.error_message: str | None = None
@@ -56,24 +60,32 @@ class FunAsrCallback(RecognitionCallback):
             return
 
         is_sentence_end = RecognitionResult.is_sentence_end(sentence)
-        self.events.append({"text": text, "is_sentence_end": is_sentence_end})
-        if is_sentence_end:
-            self.final_sentences.append(text)
+        with self.lock:
+            self.events.append({"text": text, "is_sentence_end": is_sentence_end})
+            if is_sentence_end:
+                self.final_sentences.append(text)
 
     def on_error(self, result: RecognitionResult) -> None:
-        self.error_message = getattr(result, "message", str(result))
+        with self.lock:
+            self.error_message = getattr(result, "message", str(result))
 
     def final_text(self) -> str:
-        if self.final_sentences:
-            return " ".join(self.final_sentences).strip()
-        if self.events:
-            return str(self.events[-1]["text"]).strip()
-        return ""
+        with self.lock:
+            if self.final_sentences:
+                return " ".join(self.final_sentences).strip()
+            if self.events:
+                return str(self.events[-1]["text"]).strip()
+            return ""
 
     def segment_texts(self) -> list[str]:
-        if self.final_sentences:
-            return self.final_sentences
-        return [str(event["text"]) for event in self.events]
+        with self.lock:
+            if self.final_sentences:
+                return self.final_sentences.copy()
+            return [str(event["text"]) for event in self.events]
+
+    def error(self) -> str | None:
+        with self.lock:
+            return self.error_message
 
 
 def get_secret(name: str) -> str:
@@ -137,6 +149,56 @@ def wav_to_mono_16k(raw_audio: bytes) -> tuple[bytes, float]:
         target.writeframes(pcm16)
 
     return output.getvalue(), duration_seconds
+
+
+def audio_frame_to_pcm16(frame: Any) -> tuple[bytes, float]:
+    samples = np.asarray(frame.to_ndarray())
+    sample_rate = int(getattr(frame, "sample_rate", TARGET_SAMPLE_RATE) or TARGET_SAMPLE_RATE)
+
+    if samples.ndim == 2:
+        if samples.shape[0] <= 8:
+            samples = samples.mean(axis=0)
+        elif samples.shape[1] <= 8:
+            samples = samples.mean(axis=1)
+        else:
+            samples = samples.reshape(-1)
+    else:
+        samples = samples.reshape(-1)
+
+    if samples.size == 0:
+        return b"", 0.0
+
+    if np.issubdtype(samples.dtype, np.integer):
+        info = np.iinfo(samples.dtype)
+        max_value = float(max(abs(info.min), info.max))
+        samples = samples.astype(np.float32) / max_value
+    else:
+        samples = samples.astype(np.float32)
+
+    duration_seconds = samples.size / sample_rate
+    if sample_rate != TARGET_SAMPLE_RATE:
+        target_count = max(1, int(round(duration_seconds * TARGET_SAMPLE_RATE)))
+        source_positions = np.linspace(0.0, duration_seconds, num=samples.size, endpoint=False)
+        target_positions = np.linspace(0.0, duration_seconds, num=target_count, endpoint=False)
+        samples = np.interp(target_positions, source_positions, samples).astype(np.float32)
+
+    pcm16 = np.clip(samples * 32767.0, -32768, 32767).astype("<i2").tobytes()
+    return pcm16, duration_seconds
+
+
+def create_recognition(api_key: str, callback: FunAsrCallback) -> Recognition:
+    dashscope.api_key = api_key
+    dashscope.base_websocket_api_url = MAINLAND_WEBSOCKET_URL
+    return Recognition(
+        model=MODEL_NAME,
+        format="pcm",
+        sample_rate=TARGET_SAMPLE_RATE,
+        language_hints=["zh"],
+        semantic_punctuation_enabled=st.session_state.semantic_punctuation_enabled,
+        max_sentence_silence=st.session_state.max_sentence_silence,
+        heartbeat=True,
+        callback=callback,
+    )
 
 
 def write_temp_audio(raw_audio: bytes, suffix: str) -> str:
@@ -223,8 +285,8 @@ def recognize_with_fun_asr(
     recognition.stop()
     progress.empty()
 
-    if callback.error_message:
-        raise RuntimeError(callback.error_message)
+    if callback.error():
+        raise RuntimeError(callback.error())
 
     text = callback.final_text()
     if not text:
@@ -304,6 +366,89 @@ def render_transcript(transcript: Transcript) -> None:
             f"First package: {transcript.first_package_delay_ms} ms · "
             f"Last package: {transcript.last_package_delay_ms} ms"
         )
+
+
+def render_live_card(placeholder: Any, text: str, elapsed_seconds: float, is_active: bool) -> None:
+    status = "正在实时识别" if is_active else "已停止"
+    visible_text = text or "请点击 START，允许麦克风权限，然后直接说宁波话。"
+    placeholder.markdown(
+        f"""
+        <div class="result-card">
+            <div class="result-label">{status} · {elapsed_seconds:.1f}s</div>
+            <div class="result-text">{html.escape(visible_text)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def stream_microphone_to_fun_asr(ctx: Any, api_key: str) -> Transcript | None:
+    audio_receiver = ctx.audio_receiver
+    if not audio_receiver:
+        return None
+
+    callback = FunAsrCallback()
+    recognition = create_recognition(api_key, callback)
+    live_placeholder = st.empty()
+    metric_placeholder = st.empty()
+    segment_placeholder = st.empty()
+    started_at = time.monotonic()
+    streamed_seconds = 0.0
+
+    # SECURITY-REVIEW: Microphone frames are streamed to Alibaba ASR and not persisted locally.
+    recognition.start()
+    render_live_card(live_placeholder, "", 0.0, True)
+
+    try:
+        while ctx.state.playing:
+            try:
+                frames = audio_receiver.get_frames(timeout=1)
+            except queue.Empty:
+                frames = []
+
+            for frame in frames:
+                pcm16, frame_seconds = audio_frame_to_pcm16(frame)
+                if not pcm16:
+                    continue
+                recognition.send_audio_frame(pcm16)
+                streamed_seconds += frame_seconds
+
+            error_message = callback.error()
+            if error_message:
+                raise RuntimeError(error_message)
+
+            elapsed_seconds = time.monotonic() - started_at
+            text = callback.final_text()
+            render_live_card(live_placeholder, text, elapsed_seconds, True)
+            metric_placeholder.caption(
+                f"已发送 {streamed_seconds:.1f}s 音频 · "
+                f"预估费用 ${streamed_seconds * MAINLAND_PRICE_USD_PER_SECOND:.6f}"
+            )
+
+            segments = callback.segment_texts()
+            if segments:
+                segment_placeholder.write(" / ".join(segments[-3:]))
+
+            time.sleep(0.03)
+    finally:
+        recognition.stop()
+
+    text = callback.final_text()
+    if not text:
+        render_live_card(live_placeholder, "", streamed_seconds, False)
+        return None
+
+    transcript = Transcript(
+        text=text,
+        segments=callback.segment_texts(),
+        request_id=recognition.get_last_request_id(),
+        duration_seconds=streamed_seconds,
+        first_package_delay_ms=recognition.get_first_package_delay(),
+        last_package_delay_ms=recognition.get_last_package_delay(),
+        estimated_cost_usd=streamed_seconds * MAINLAND_PRICE_USD_PER_SECOND,
+    )
+    render_live_card(live_placeholder, transcript.text, streamed_seconds, False)
+    return transcript
 
 
 def init_state() -> None:
@@ -396,24 +541,32 @@ with st.sidebar:
         value=st.session_state.semantic_punctuation_enabled,
     )
     st.session_state.throttle_stream = st.toggle(
-        "按实时速度发送音频",
+        "上传文件按实时速度发送",
         value=st.session_state.throttle_stream,
-        help="更贴近 Fun-ASR realtime 的推荐用法；关闭后处理更快但长音频稳定性可能下降。",
+        help="只影响上传文件；实时麦克风会按真实语速发送。",
     )
     st.caption("模型：fun-asr-realtime · Endpoint：dashscope.aliyuncs.com")
 
-record_tab, upload_tab = st.tabs(["现场录音", "上传音频"])
+live_tab, upload_tab = st.tabs(["实时麦克风", "上传音频"])
 
-with record_tab:
-    recorded_audio = st.audio_input("按住录音，说一段宁波话")
-    if recorded_audio and st.button("识别这段录音", type="primary"):
+with live_tab:
+    st.info("点击 START 并允许麦克风权限后，直接说宁波话（吴语）。文字会自动实时更新。")
+    ctx = webrtc_streamer(
+        key="ningbo-live-microphone",
+        mode=WebRtcMode.SENDONLY,
+        media_stream_constraints={"audio": True, "video": False},
+        audio_receiver_size=1024,
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+    )
+
+    if ctx.state.playing and ctx.audio_receiver:
         try:
-            with st.spinner("正在识别宁波话..."):
-                transcript = transcribe(recorded_audio, api_key)
-            add_history("录音", transcript)
-            render_transcript(transcript)
+            transcript = stream_microphone_to_fun_asr(ctx, api_key)
+            if transcript:
+                add_history("实时麦克风", transcript)
+                render_transcript(transcript)
         except Exception as error:
-            st.error(f"识别失败：{error}")
+            st.error(f"实时识别失败：{error}")
 
 with upload_tab:
     uploaded_audio = st.file_uploader(

@@ -7,7 +7,7 @@ Streamlit web app for transcribing Ningbo dialect / Wu Chinese speech into Manda
 - Alibaba Cloud Model Studio `fun-asr-realtime`
 - Chinese Mainland deployment scope
 - Beijing WebSocket endpoint: `wss://dashscope.aliyuncs.com/api-ws/v1/inference`
-- Audio target: 16 kHz mono WAV for browser recordings
+- Live microphone audio target: 16 kHz mono PCM
 
 ## Streamlit Setup
 
@@ -31,8 +31,15 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Usage
+
+1. Open the app and choose **实时麦克风**.
+2. Click **START** and allow browser microphone access.
+3. Speak Ningbo dialect directly. The Mandarin text updates while you speak.
+4. Click **STOP** to close the live Fun-ASR session.
+
 ## Notes
 
 - Use a Chinese Mainland Alibaba Model Studio API key for this app.
-- Browser recordings are normalized to 16 kHz mono PCM WAV before being streamed to Fun-ASR.
+- Live microphone frames are streamed directly to Fun-ASR and are not saved first.
 - Upload support is limited to Fun-ASR realtime formats: WAV, MP3, AAC, AMR, OPUS, SPEEX.
